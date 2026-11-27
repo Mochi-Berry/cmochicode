@@ -54,6 +54,9 @@ typedef struct {
     const char *u_names[128];
     CmcType     u_types[128];
     int         u_n;
+    /* exception handling (best-effort, no unwinding) */
+    int       try_depth;
+    const char *last_thrown;
 } Emit;
 
 static EStr estr(const char *code, CmcType t, int esc, int ptr, const char *sn) {
@@ -77,9 +80,9 @@ static void flush_pre(Emit *em) {
     if (em->pre.len) { b_put(&em->out, em->pre.s); em->pre.len = 0; em->pre.s[0] = 0; }
 }
 static const char *tmp_name(Emit *em, const char *base) {
-    static char buf[64];
+    char buf[64];
     snprintf(buf, sizeof buf, "__%s_%d", base, em->tmp++);
-    return buf;
+    return cmc_arena_strndup(em->ctx->arena, buf, strlen(buf));
 }
 static void c_lit(Buf *b, const char *s) {
     b_put(b, "\"");
@@ -90,6 +93,7 @@ static void c_lit(Buf *b, const char *s) {
         else if (*p == '\r') b_put(b, "\\r");
         else if (*p == '\t') b_put(b, "\\t");
         else if (*p < 32 || *p > 126) b_putf(b, "\\x%02x", *p);
+        else if (*p == '?') b_put(b, "\\x3f"); /* avoid C99 trigraphs (??= etc) */
         else b_putn(b, (const char *)p, 1);
     }
     b_put(b, "\"");
@@ -164,6 +168,7 @@ static void append_print_arg(Emit *em, CmcNode *node, EStr e, Buf *fmt, Buf *far
     if (node && node->kind == N_STR) {
         for (const char *p = node->str; *p; p++) {
             if (*p == '%') b_put(fmt, "%%");
+            else if (*p == '?') b_put(fmt, "\\x3f"); /* avoid C99 trigraphs */
             else b_putn(fmt, p, 1);
         }
         return;
@@ -173,6 +178,7 @@ static void append_print_arg(Emit *em, CmcNode *node, EStr e, Buf *fmt, Buf *far
             if (node->quasis[i]) {
                 for (const char *p = node->quasis[i]->str; *p; p++) {
                     if (*p == '%') b_put(fmt, "%%");
+                    else if (*p == '?') b_put(fmt, "\\x3f");
                     else b_putn(fmt, p, 1);
                 }
             }
@@ -183,7 +189,7 @@ static void append_print_arg(Emit *em, CmcNode *node, EStr e, Buf *fmt, Buf *far
                 else if (ev.type == CT_DOUBLE) { b_put(fmt, "%g"); farg_push(fargs, ev.code); }
                 else if (ev.type == CT_STR) { b_put(fmt, "%s"); farg_push(fargs, ev.code); }
                 else if (ev.type == CT_MOCHI_VAL) { b_put(fmt, "%s"); char t[128]; snprintf(t, sizeof t, "mochi_val_str(%s)", ev.code); farg_push(fargs, t); }
-                else if (ev.type == CT_BOOL) { b_put(fmt, "%d"); farg_push(fargs, ev.code); }
+                else if (ev.type == CT_BOOL) { b_put(fmt, "%s"); char t[128]; snprintf(t, sizeof t, "(%s ? \"true\" : \"false\")", ev.code); farg_push(fargs, t); }
                 else { b_put(fmt, "%s"); Buf s; b_init(&s); co_str(em, &s, ev); farg_push(fargs, s.s); free(s.s); }
             }
         }
@@ -193,7 +199,7 @@ static void append_print_arg(Emit *em, CmcNode *node, EStr e, Buf *fmt, Buf *far
     else if (e.type == CT_INT64) { b_put(fmt, "%lld"); farg_push(fargs, e.code); }
     else if (e.type == CT_DOUBLE) { b_put(fmt, "%g"); farg_push(fargs, e.code); }
     else if (e.type == CT_STR) { b_put(fmt, "%s"); farg_push(fargs, e.code); }
-    else if (e.type == CT_BOOL) { b_put(fmt, "%d"); farg_push(fargs, e.code); }
+    else if (e.type == CT_BOOL) { b_put(fmt, "%s"); char t[128]; snprintf(t, sizeof t, "(%s ? \"true\" : \"false\")", e.code); farg_push(fargs, t); }
     else if (e.type == CT_MOCHI_VAL) { b_put(fmt, "%s"); char t[128]; snprintf(t, sizeof t, "mochi_val_str(%s)", e.code); farg_push(fargs, t); }
     else if (e.type == CT_NULL || e.type == CT_UNDEF) { b_put(fmt, "null"); }
     else if (e.type == CT_ARR) {
@@ -491,11 +497,20 @@ static EStr emit_assign(Emit *em, CmcNode *n) {
                 b_putf(&b, "%s = mochi_concat(%s, %s)", target, target, rv.s);
                 free(rv.s);
             } else {
-                Buf rv; b_init(&rv); co_num(em, &rv, r);
-                if (n->op == TK_SLASHEQ) b_putf(&b, "%s = (%s / %s)", target, target, rv.s);
-                else if (n->op == TK_PERCENTEQ) b_putf(&b, "%s = fmod(%s, %s)", target, target, rv.s);
-                else b_putf(&b, "%s %s= %s", target, cop, rv.s);
-                free(rv.s);
+            Buf rv; b_init(&rv);
+            if (t == CT_STR) co_str(em, &rv, r); else co_num(em, &rv, r);
+            if (n->op == TK_OROREQ)      { b_putf(&b, "%s = ((%s) ? (%s) : (%s))", target, target, target, rv.s); }
+            else if (n->op == TK_ANDANDEQ){ b_putf(&b, "%s = ((%s) ? (%s) : (%s))", target, target, rv.s, target); }
+            else if (n->op == TK_NULLISHEQ) {
+                if (t == CT_STR || t == CT_OBJ || t == CT_ARR || t == CT_NULL || t == CT_MOCHI_VAL || t == CT_UNDEF)
+                    b_putf(&b, "%s = ((%s) != NULL ? (%s) : (%s))", target, target, target, rv.s);
+                else
+                    b_putf(&b, "(void)(%s)", target);   /* numbers are never nullish */
+            }
+            else if (n->op == TK_SLASHEQ) b_putf(&b, "%s = (%s / %s)", target, target, rv.s);
+            else if (n->op == TK_PERCENTEQ) b_putf(&b, "%s = fmod(%s, %s)", target, target, rv.s);
+            else b_putf(&b, "%s %s= %s", target, cop, rv.s);
+            free(rv.s);
             }
         }
         return estr(b.s, t, r.escapes, r.ptr, s ? s->struct_name : NULL);
@@ -604,7 +619,8 @@ static EStr emit_object(Emit *em, CmcNode *n) {
     const char *sn = cmc_register_shape(em->ctx->arena, n);
     int np = n->nprops;
     EStr *vals = (EStr *)malloc(sizeof(EStr) * (np ? np : 1));
-    for (int i = 0; i < np; i++) vals[i] = emit_expr(em, n->props[i].value);
+    for (int i = 0; i < np; i++) vals[i] = (n->props[i].spread || n->props[i].key == NULL)
+        ? estr("0", CT_UNKNOWN, 0, 0, NULL) : emit_expr(em, n->props[i].value);
     const char *obj = tmp_name(em, "obj");
     Buf alloc; b_init(&alloc);
     b_putf(&alloc, "struct %s *%s = (struct %s *)CMC_ALLOC(sizeof(struct %s));", sn, obj, sn, sn);
@@ -612,6 +628,7 @@ static EStr emit_object(Emit *em, CmcNode *n) {
     free(alloc.s);
     for (int i = 0; i < np; i++) {
         CmcProp *pr = &n->props[i];
+        if (pr->spread || pr->key == NULL) continue; /* spread: not merged in this build (documented) */
         Buf v; b_init(&v);
         const char *ft = cmc_struct_field_type(sn, pr->key);
         if (!ft) ft = "double";
@@ -759,6 +776,96 @@ static void arg_has(Emit *em, CmcNode *arg, Buf *out)
     }
 }
 
+/* Higher-order array methods (map/filter/reduce/forEach) with an inline arrow.
+   The callback is not a C function pointer — the arrow body is INLINED into a
+   C loop, so no closure/indirect-call machinery is needed. Only simple arrows
+   with a single numeric (or two for reduce) ident parameter are supported;
+   anything else degrades to a no-op `0` so the generated C still compiles. */
+static EStr emit_arr_higher(Emit *em, CmcNode *n, const char *prop, EStr o) {
+    if (n->nargs < 1 || n->args[0]->kind != N_ARROW) return estr("0", CT_INT, 0, 0, NULL);
+    CmcNode *fn = n->args[0];
+    int np = fn->nparams ? fn->nparams : 0;
+    if (np < 1 || fn->params[0]->kind != N_IDENT) return estr("0", CT_INT, 0, 0, NULL);
+    const char *pname = fn->params[0]->name;
+    const char *pname2 = (np > 1 && fn->params[1]->kind == N_IDENT) ? fn->params[1]->name : NULL;
+    if (strcmp(prop, "reduce") == 0 && !pname2) return estr("0", CT_INT, 0, 0, NULL);
+
+    char li[32]; snprintf(li, sizeof li, "__i%d", em->tmp); em->tmp++;
+    char ind[16]; for (int i = 0; i < em->indent; i++) ind[i] = ' '; ind[em->indent] = 0;
+    Buf out_loop; b_init(&out_loop);
+    const char *result_name = NULL;
+
+    cmc_env_push(&em->env, em->ctx->arena);
+    cmc_env_decl(&em->env, pname, CT_DOUBLE, SYM_LOCAL);
+    if (pname2) cmc_env_decl(&em->env, pname2, CT_DOUBLE, SYM_LOCAL);
+
+    CmcNode *body_node = fn->body;
+    if (body_node && body_node->kind == N_EXPRSTMT && body_node->lhs) body_node = body_node->lhs;
+
+    if (strcmp(prop, "forEach") == 0) {
+        b_putf(&out_loop, "%sfor (size_t %s = 0; %s < (%s)->len; %s++) {\n", ind, li, li, o.code, li);
+        b_putf(&out_loop, "%s    double %s = mochi_val_num((%s)->items[%s]);\n", ind, pname, o.code, li);
+        Buf bodys; b_init(&bodys);
+        if (body_node) {
+            Buf saved = em->out; em->out = bodys;
+            EStr be = emit_expr(em, body_node);
+            em->out = saved;
+            if (be.type != CT_VOID && be.type != CT_UNDEF) b_putf(&bodys, "%s    (void)(%s);\n", ind, be.code);
+        }
+        b_put(&out_loop, bodys.s);
+        b_putf(&out_loop, "%s}\n", ind);
+        free(bodys.s);
+    } else {
+        char outv[32]; snprintf(outv, sizeof outv, "__out%d", em->tmp);
+        char acc[32];  snprintf(acc,  sizeof acc,  "__acc%d", em->tmp);
+        if (strcmp(prop, "map") == 0 || strcmp(prop, "filter") == 0) {
+            b_putf(&out_loop, "%smochi_array *%s = mochi_array_new();\n", ind, outv);
+            b_putf(&out_loop, "%sfor (size_t %s = 0; %s < (%s)->len; %s++) {\n", ind, li, li, o.code, li);
+            b_putf(&out_loop, "%s    double %s = mochi_val_num((%s)->items[%s]);\n", ind, pname, o.code, li);
+        } else {
+            b_putf(&out_loop, "%sdouble %s = 0;\n", ind, acc);
+            b_putf(&out_loop, "%sfor (size_t %s = 0; %s < (%s)->len; %s++) {\n", ind, li, li, o.code, li);
+            b_putf(&out_loop, "%s    double %s = %s;\n", ind, pname, acc);
+            b_putf(&out_loop, "%s    double %s = mochi_val_num((%s)->items[%s]);\n", ind, pname2, o.code, li);
+        }
+        Buf bodyc; b_init(&bodyc);
+        CmcType btype = CT_UNKNOWN;
+        if (body_node) {
+            Buf saved = em->out; em->out = bodyc;
+            EStr be = emit_expr(em, body_node);
+            em->out = saved;
+            b_put(&bodyc, be.code);
+            btype = be.type;
+        }
+        if (strcmp(prop, "map") == 0) {
+            if (btype == CT_STR)
+                b_putf(&out_loop, "%s    mochi_array_push(%s, mochi_str((%s)));\n", ind, outv, bodyc.len ? bodyc.s : "\"\"");
+            else
+                b_putf(&out_loop, "%s    mochi_array_push(%s, mochi_num((double)(%s)));\n", ind, outv, bodyc.len ? bodyc.s : "0");
+        } else if (strcmp(prop, "filter") == 0) {
+            b_putf(&out_loop, "%s    if (%s) mochi_array_push(%s, (%s)->items[%s]);\n", ind, bodyc.len ? bodyc.s : "0", outv, o.code, li);
+        } else {
+            b_putf(&out_loop, "%s    %s = (%s);\n", ind, acc, bodyc.len ? bodyc.s : "0");
+        }
+        b_putf(&out_loop, "%s}\n", ind);
+        free(bodyc.s);
+        if (strcmp(prop, "map") == 0 || strcmp(prop, "filter") == 0)
+            result_name = cmc_arena_strndup(em->ctx->arena, outv, strlen(outv));
+        else
+            result_name = cmc_arena_strndup(em->ctx->arena, acc, strlen(acc));
+    }
+    cmc_env_pop(&em->env);
+    /* the loop is a statement: push to pre-lines so it precedes the current stmt */
+    b_put(&em->pre, out_loop.s);
+    free(out_loop.s);
+    if (result_name) {
+        if (strcmp(prop, "map") == 0 || strcmp(prop, "filter") == 0)
+            return estr(result_name, CT_ARR, 0, 1, NULL);
+        return estr(result_name, CT_DOUBLE, 0, 0, NULL);
+    }
+    return estr("0", CT_INT, 0, 0, NULL);
+}
+
 static EStr emit_call(Emit *em, CmcNode *n) {
     CmcNode *callee = n->obj;
     if (callee->kind == N_IDENT) {
@@ -881,6 +988,11 @@ static EStr emit_call(Emit *em, CmcNode *n) {
                 t = CT_STR;
             } else if (strcmp(prop, "length") == 0) {
                 b_putf(&b, "(int)(%s%slen)", o.code, o.ptr ? "->" : ".");
+            } else if (strcmp(prop, "map") == 0 || strcmp(prop, "filter") == 0 ||
+                       strcmp(prop, "reduce") == 0 || strcmp(prop, "forEach") == 0) {
+                EStr r = emit_arr_higher(em, n, prop, o);
+                free(args);
+                return r;
             } else b_putf(&b, "0");
             free(args);
             return estr(b.s, t, 0, t == CT_STR ? 1 : 0, NULL);
@@ -900,11 +1012,16 @@ static EStr emit_call(Emit *em, CmcNode *n) {
                 t = CT_INT;
             }
             else if (strcmp(prop, "trim") == 0) b_putf(&b, "mochi_trim(%s)", o.code);
-            else if (strcmp(prop, "includes") == 0) { em->need_string = 1; b_putf(&b, "(strstr(%s, %s) != NULL)", o.code, args[0].code); t = CT_BOOL; }
-            else if (strcmp(prop, "startsWith") == 0) { em->need_string = 1; b_putf(&b, "(strncmp(%s, %s, strlen(%s)) == 0)", o.code, args[0].code, args[0].code); t = CT_BOOL; }
+            else if (strcmp(prop, "includes") == 0) { em->need_string = 1; b_putf(&b, "mochi_includes(%s, %s)", o.code, args[0].code); t = CT_BOOL; }
+            else if (strcmp(prop, "startsWith") == 0) { b_putf(&b, "mochi_starts_with(%s, %s)", o.code, args[0].code); t = CT_BOOL; }
+            else if (strcmp(prop, "endsWith") == 0) { b_putf(&b, "mochi_ends_with(%s, %s)", o.code, args[0].code); t = CT_BOOL; }
+            else if (strcmp(prop, "slice") == 0) b_putf(&b, "mochi_slice(%s, %s, %s)", o.code, args[0].code, n->nargs > 1 ? args[1].code : "1000000");
+            else if (strcmp(prop, "repeat") == 0) b_putf(&b, "mochi_repeat(%s, %s)", o.code, args[0].code);
+            else if (strcmp(prop, "replace") == 0) b_putf(&b, "mochi_replace(%s, %s, %s)", o.code, args[0].code, args[1].code);
+            else if (strcmp(prop, "split") == 0) { b_putf(&b, "mochi_split(%s, %s)", o.code, args[0].code); t = CT_ARR; }
             else b_putf(&b, "%s", o.code);
             free(args);
-            return estr(b.s, t, 0, t == CT_STR ? 1 : 0, NULL);
+            return estr(b.s, t, 0, (t == CT_STR || t == CT_ARR) ? 1 : 0, NULL);
         }
         if (o.type == CT_OBJ && o.struct_name) {
             Buf b; b_init(&b);
@@ -989,9 +1106,12 @@ static void uninit_collect(Emit *em, CmcNode *s) {
     if (!s) return;
     switch (s->kind) {
         case N_VAR:
-            for (int i = 0; i < s->nstmts; i++)
-                if (s->stmts[i]->lhs && s->stmts[i]->lhs->kind == N_IDENT && s->stmts[i]->rhs == NULL)
-                    uninit_record(em, s->stmts[i]->lhs->name);
+            for (int i = 0; i < s->nstmts; i++) {
+                CmcNode *dcl = s->stmts[i];
+                if (dcl->lhs && dcl->lhs->kind == N_IDENT &&
+                    (dcl->rhs == NULL || dcl->rhs->kind == N_NULL || dcl->rhs->kind == N_UNDEF))
+                    uninit_record(em, dcl->lhs->name);
+            }
             break;
         case N_IF:  uninit_collect(em, s->cons); uninit_collect(em, s->alt); break;
         case N_WHILE: case N_DOWHILE: uninit_collect(em, s->stmt); break;
@@ -1072,9 +1192,18 @@ static void emit_var_decl(Emit *em, CmcNode *n) {
         flush_pre(em);
         if (d->rhs->kind == N_ARROW) {
             /* `const f = (a,b=10) => ...` — f aliases the generated function. */
-            CmcSym *fs = cmc_env_decl(&em->env, name, CT_UNKNOWN, SYM_FUNC);
+            CmcSym *fs = cmc_env_decl(&em->env, name, fn_return_type(d->rhs), SYM_FUNC);
             fs->cname = e.code;
             fs->func_node = d->rhs;
+            continue;
+        }
+        /* `var x = null/undefined` with a later assignment: use the resolved type. */
+        if ((d->rhs->kind == N_NULL || d->rhs->kind == N_UNDEF) && uninit_type(em, name) != CT_UNKNOWN) {
+            CmcType rt = uninit_type(em, name);
+            cmc_env_decl(&em->env, name, rt, SYM_LOCAL);
+            if (rt == CT_STR) e_linef(em, "const char *%s = NULL;", name);
+            else if (rt == CT_OBJ) e_linef(em, "void *%s = NULL;", name);
+            else e_linef(em, "double %s = 0;", name);
             continue;
         }
         CmcType t = e.type;
@@ -1204,6 +1333,33 @@ static void emit_forof(Emit *em, CmcNode *n) {
     e_line(em, "}");
 }
 
+static void emit_forin(Emit *em, CmcNode *n) {
+    EStr obj = emit_expr(em, n->test);
+    flush_pre(em);
+    const char *sname = obj.struct_name;
+    if (!sname) { e_line(em, "(void)0;"); return; }
+    cmc_env_decl(&em->env, n->left->name, CT_STR, SYM_LOCAL);
+    const char *keys = tmp_name(em, "keys");
+    const char *ki = tmp_name(em, "ki");
+    int nf = 0;
+    e_linef(em, "const char *%s[] = {", keys);
+    for (int f = 0; f < 64; f++) {
+        const char *fn = cmc_struct_field_name_n(sname, f);
+        if (!fn) break;
+        if (nf) e_line(em, ", ");
+        e_linef(em, "\"%s\"", fn);
+        nf++;
+    }
+    e_line(em, "};");
+    if (nf == 0) return;
+    e_linef(em, "for (size_t %s = 0; %s < %d; %s++) {", ki, ki, nf, ki);
+    em->indent++;
+    e_linef(em, "const char *%s = %s[%s];", n->left->name, keys, ki);
+    emit_stmt(em, n->stmt);
+    em->indent--;
+    e_line(em, "}");
+}
+
 static void emit_switch(Emit *em, CmcNode *n) {
     EStr disc = emit_expr(em, n->test);
     int first = 1;
@@ -1256,6 +1412,7 @@ static void emit_stmt(Emit *em, CmcNode *n) {
         }
         case N_FOR: emit_for(em, n); break;
         case N_FOROF: emit_forof(em, n); break;
+        case N_FORIN: emit_forin(em, n); break;
         case N_RETURN: {
             if (n->lhs) {
                 EStr e = emit_expr(em, n->lhs);
@@ -1277,13 +1434,26 @@ static void emit_stmt(Emit *em, CmcNode *n) {
             EStr e = emit_expr(em, n->lhs);
             Buf r; b_init(&r);
             co_str(em, &r, e);
-            e_linef(em, "fprintf(stderr, \"Exception: %%s\\n\", %s);", r.s);
+            const char *tv = tmp_name(em, "thrown");
+            e_linef(em, "const char *%s = %s;", tv, r.s);
+            em->last_thrown = tv;
+            if (em->try_depth == 0)
+                e_linef(em, "fprintf(stderr, \"Exception: %%s\\n\", %s);", tv);
             free(r.s);
             break;
         }
         case N_TRY: {
+            em->try_depth++;
             emit_stmt(em, n->stmt);
-            if (n->alt) e_line(em, "/* catch: best-effort, no unwinding */");
+            em->try_depth--;
+            if (n->alt) {
+                if (n->third && n->third->kind == N_IDENT) {
+                    cmc_env_decl(&em->env, n->third->name, CT_STR, SYM_LOCAL);
+                    e_linef(em, "const char *%s = %s ? %s : \"\";", n->third->name,
+                            em->last_thrown ? em->last_thrown : "0", em->last_thrown ? em->last_thrown : "\"\"");
+                }
+                emit_stmt(em, n->alt);
+            }
             break;
         }
         case N_EXPRSTMT: {
@@ -1329,6 +1499,33 @@ static CmcType fn_return_type(CmcNode *fn) {
         else if (cur->kind == N_VAR) for (int i = 0; i < cur->nstmts; i++) stack[sp++] = cur->stmts[i];
         else if (cur->kind == N_EXPRSTMT) stack[sp++] = cur->lhs;
         else if (cur->kind == N_RETURN) stack[sp++] = cur->lhs;
+    }
+    /* expression-bodied arrow: infer from the body expression */
+    if (!saw && fn->is_expr_body && fn->body) {
+        CmcNode *b = fn->body;
+        if (b->kind == N_EXPRSTMT && b->lhs) b = b->lhs;
+        if (b->kind == N_NUM) return (b->num == (long long)b->num) ? CT_INT : CT_DOUBLE;
+        if (b->kind == N_STR) return CT_STR;
+        if (b->kind == N_BOOL) return CT_BOOL;
+        if (b->kind == N_BIGINT) return CT_INT64;
+        if (b->kind == N_NULL) return CT_NULL;
+        if (b->kind == N_ARR) return CT_ARR;
+        if (b->kind == N_OBJ) return CT_OBJ;
+        if (b->kind == N_BIN) {
+            if (b->op == TK_PLUS) {
+                /* string concat if either side is a string literal */
+                CmcNode *l = b->lhs, *r = b->rhs;
+                if ((l->kind == N_STR && r->kind == N_STR) ||
+                    (l->kind == N_STR) || (r->kind == N_STR)) return CT_STR;
+            }
+            if (b->op == TK_LT || b->op == TK_GT || b->op == TK_LE || b->op == TK_GE ||
+                b->op == TK_EQEQ || b->op == TK_NE || b->op == TK_ANDAND || b->op == TK_OROR)
+                return CT_BOOL;
+            if (b->op == TK_SLASH) return CT_DOUBLE;
+            /* arithmetic: emit_arrow resolves unknown params to CT_INT */
+            return CT_INT;
+        }
+        if (b->kind == N_CALL) return CT_INT;
     }
     return saw ? ret : CT_VOID;
 }

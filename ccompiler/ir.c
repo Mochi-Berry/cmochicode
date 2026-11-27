@@ -115,6 +115,7 @@ static const char *shape_sig(CmcArena *arena, CmcNode *obj) {
     char buf[512]; size_t p = 0;
     for (int i = 0; i < obj->nprops; i++) {
         CmcProp *pr = &obj->props[i];
+        if (pr->spread || pr->key == NULL) continue; /* spread handled at emit (limited) */
         CmcType t = CT_UNKNOWN;
         if (pr->value) {
             CmcNode *v = pr->value;
@@ -149,9 +150,14 @@ const char *cmc_register_shape(CmcArena *arena, CmcNode *obj) {
     char nm[32]; snprintf(nm, sizeof nm, "CmcStruct_%d", g_shapes.n);
     sh->name = cmc_arena_strndup(arena, nm, strlen(nm));
     sh->literal = obj;
-    sh->nfields = obj->nprops;
+    int nf = 0;
+    for (int i = 0; i < obj->nprops && i < 32; i++)
+        if (!(obj->props[i].spread || obj->props[i].key == NULL)) nf++;
+    sh->nfields = nf;
+    int fi = 0;
     for (int i = 0; i < obj->nprops && i < 32; i++) {
-        sh->field_names[i] = obj->props[i].key;
+        if (obj->props[i].spread || obj->props[i].key == NULL) continue; /* spread: skip */
+        sh->field_names[fi] = obj->props[i].key;
         CmcNode *v = obj->props[i].value;
         CmcType t = CT_UNKNOWN;
         if (v) {
@@ -164,7 +170,8 @@ const char *cmc_register_shape(CmcArena *arena, CmcNode *obj) {
             else if (v->kind == N_OBJ) t = CT_OBJ;
             else t = CT_UNKNOWN;
         }
-        sh->field_types[i] = t;
+        sh->field_types[fi] = t;
+        fi++;
     }
     return sh->name;
 }

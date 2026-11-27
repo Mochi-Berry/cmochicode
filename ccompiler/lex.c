@@ -194,22 +194,24 @@ CmcToken cmc_lex_next(CmcLexer *lx) {
             advance(lx); advance(lx);
             while (is_ident_char(peek(lx))) advance(lx);
         } else {
-            while (is_digit(peek(lx))) advance(lx);
+            while (is_digit(peek(lx)) || peek(lx) == '_') advance(lx); /* separators */
             if (peek(lx) == '.' && is_digit(peek2(lx))) {
                 advance(lx);
-                while (is_digit(peek(lx))) advance(lx);
+                while (is_digit(peek(lx)) || peek(lx) == '_') advance(lx);
             }
             if (peek(lx) == 'e' || peek(lx) == 'E') {
                 advance(lx);
                 if (peek(lx) == '+' || peek(lx) == '-') advance(lx);
-                while (is_digit(peek(lx))) advance(lx);
+                while (is_digit(peek(lx)) || peek(lx) == '_') advance(lx);
             }
         }
         if (peek(lx) == 'n') { advance(lx); is_bigint = 1; }
-        /* materialize NUL-terminated copy to parse */
+        /* materialize NUL-terminated copy to parse, folding `_` separators out */
         size_t n = lx->pos - start;
         char *tmp = (char *)cmc_arena_alloc(lx->arena, n + 1);
-        memcpy(tmp, lx->src + start, n); tmp[n] = 0;
+        size_t w = 0;
+        for (size_t k = start; k < lx->pos; k++) if (lx->src[k] != '_') tmp[w++] = lx->src[k];
+        tmp[w] = 0;
         CmcToken t = tok(is_bigint ? TK_BIGINT : TK_NUM, lx, start, line, col);
         if (is_bigint) {
             char *endp = NULL;
@@ -255,7 +257,7 @@ CmcToken cmc_lex_next(CmcLexer *lx) {
         case ',': return tok(TK_COMMA, lx, start, line, col);
         case ':': return tok(TK_COLON, lx, start, line, col);
         case '?':
-            if (c2 == '?') { advance(lx); return tok(TK_NULLISH, lx, start, line, col); }
+            if (c2 == '?') { advance(lx); if (peek(lx) == '=') { advance(lx); return tok(TK_NULLISHEQ, lx, start, line, col); } return tok(TK_NULLISH, lx, start, line, col); }
             if (c2 == '.') { advance(lx); return tok(TK_QMARKDOT, lx, start, line, col); }
             return tok(TK_QMARK, lx, start, line, col);
         case '.': if (c2 == '.') { advance(lx); if (peek(lx) == '.') { advance(lx); return tok(TK_DOTDOTDOT, lx, start, line, col); } return tok(TK_DOTDOTDOT, lx, start, line, col); } return tok(TK_DOT, lx, start, line, col);
@@ -291,8 +293,8 @@ CmcToken cmc_lex_next(CmcLexer *lx) {
             }
             if (c2 == '=') { advance(lx); return tok(TK_GE, lx, start, line, col); }
             return tok(TK_GT, lx, start, line, col);
-        case '&': if (c2 == '&') { advance(lx); return tok(TK_ANDAND, lx, start, line, col); } if (c2 == '=') { advance(lx); return tok(TK_ANDEQ, lx, start, line, col); } return tok(TK_AND, lx, start, line, col);
-        case '|': if (c2 == '|') { advance(lx); return tok(TK_OROR, lx, start, line, col); } if (c2 == '=') { advance(lx); return tok(TK_OREQ, lx, start, line, col); } return tok(TK_OR, lx, start, line, col);
+        case '&': if (c2 == '&') { advance(lx); if (peek(lx) == '=') { advance(lx); return tok(TK_ANDANDEQ, lx, start, line, col); } return tok(TK_ANDAND, lx, start, line, col); } if (c2 == '=') { advance(lx); return tok(TK_ANDEQ, lx, start, line, col); } return tok(TK_AND, lx, start, line, col);
+        case '|': if (c2 == '|') { advance(lx); if (peek(lx) == '=') { advance(lx); return tok(TK_OROREQ, lx, start, line, col); } return tok(TK_OROR, lx, start, line, col); } if (c2 == '=') { advance(lx); return tok(TK_OREQ, lx, start, line, col); } return tok(TK_OR, lx, start, line, col);
         case '^': if (c2 == '=') { advance(lx); return tok(TK_XOREQ, lx, start, line, col); } return tok(TK_XOR, lx, start, line, col);
         case '~': return tok(TK_TILDE, lx, start, line, col);
         default:

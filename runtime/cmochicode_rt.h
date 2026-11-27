@@ -142,6 +142,50 @@ static inline const char *mochi_trim(const char *s) {
     while (b > a && (s[b-1] == ' ' || s[b-1] == '\n' || s[b-1] == '\t' || s[b-1] == '\r')) b--;
     char *o = (char *)CMC_ALLOC(b - a + 1); memcpy(o, s + a, b - a); o[b - a] = 0; return o;
 }
+static inline int mochi_includes(const char *s, const char *sub) { return strstr(s, sub) != NULL; }
+static inline int mochi_starts_with(const char *s, const char *pre) { return strncmp(s, pre, strlen(pre)) == 0; }
+static inline int mochi_ends_with(const char *s, const char *suf) {
+    size_t ls = strlen(s), lf = strlen(suf);
+    return ls >= lf && strcmp(s + ls - lf, suf) == 0;
+}
+static inline const char *mochi_slice(const char *s, int st, int en) {
+    size_t l = strlen(s);
+    if (st < 0) st = (int)l + st; if (en < 0) en = (int)l + en;
+    if (st < 0) st = 0; if (en > (int)l) en = (int)l; if (en < st) en = st;
+    return mochi_substr(s, st, en - st);
+}
+static inline const char *mochi_repeat(const char *s, int n) {
+    if (n <= 0) return "";
+    size_t l = strlen(s);
+    char *o = (char *)CMC_ALLOC(l * n + 1);
+    for (int i = 0; i < n; i++) memcpy(o + i * l, s, l);
+    o[l * n] = 0; return o;
+}
+static inline const char *mochi_replace(const char *s, const char *from, const char *to) {
+    const char *p = strstr(s, from);
+    if (!p) return s;
+    size_t lf = strlen(from), lt = strlen(to);
+    size_t before = (size_t)(p - s), l = strlen(s);
+    char *o = (char *)CMC_ALLOC(l - lf + lt + 1);
+    memcpy(o, s, before); memcpy(o + before, to, lt);
+    memcpy(o + before + lt, p + lf, l - before - lf + 1);
+    return o;
+}
+static inline mochi_array *mochi_split(const char *s, const char *sep) {
+    mochi_array *a = mochi_array_new();
+    size_t l = strlen(s), sl = strlen(sep);
+    if (sl == 0) { mochi_array_push(a, mochi_str(s)); return a; }
+    const char *start = s;
+    while (1) {
+        const char *p = strstr(start, sep);
+        if (!p) { mochi_array_push(a, mochi_str(start)); break; }
+        size_t n = (size_t)(p - start);
+        char *t = (char *)CMC_ALLOC(n + 1); memcpy(t, start, n); t[n] = 0;
+        mochi_array_push(a, mochi_str(t));
+        start = p + sl;
+    }
+    return a;
+}
 static inline double mochi_rand01(void) { return (double)rand() / (double)RAND_MAX; }
 
 #endif /* CMOCHICODE_RT_H */

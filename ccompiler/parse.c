@@ -47,7 +47,8 @@ static int prec_of(CmcTokKind k) {
         case TK_EQ: case TK_PLUSEQ: case TK_MINUSEQ: case TK_STAREQ:
         case TK_SLASHEQ: case TK_PERCENTEQ: case TK_STARSTAREQ:
         case TK_ANDEQ: case TK_OREQ: case TK_XOREQ: case TK_SHLEQ:
-        case TK_SHREQ: case TK_SHRUEQ: return 1;
+        case TK_SHREQ: case TK_SHRUEQ:
+        case TK_ANDANDEQ: case TK_OROREQ: case TK_NULLISHEQ: return 1;
         case TK_QMARK: return 2;
         case TK_NULLISH: return 3;
         case TK_OROR: return 4;
@@ -71,7 +72,8 @@ static int is_assign_op(CmcTokKind k) {
     return k == TK_EQ || k == TK_PLUSEQ || k == TK_MINUSEQ || k == TK_STAREQ ||
            k == TK_SLASHEQ || k == TK_PERCENTEQ || k == TK_STARSTAREQ ||
            k == TK_ANDEQ || k == TK_OREQ || k == TK_XOREQ || k == TK_SHLEQ ||
-           k == TK_SHREQ || k == TK_SHRUEQ;
+           k == TK_SHREQ || k == TK_SHRUEQ ||
+           k == TK_ANDANDEQ || k == TK_OROREQ || k == TK_NULLISHEQ;
 }
 
 /* ------- primary / postfix ------- */
@@ -226,6 +228,16 @@ static CmcNode *parse_primary(Parser *p) {
             int cap = 4, cnt = 0;
             CmcProp *props = (CmcProp *)cmc_arena_alloc(p->arena, sizeof(CmcProp) * cap);
             while (!check(p, TK_RBRACE)) {
+                if (check(p, TK_DOTDOTDOT)) {
+                    /* spread: {...src} — record as a special prop */
+                    next(p);
+                    if (cnt == cap) { cap *= 2; CmcProp *np = (CmcProp *)cmc_arena_alloc(p->arena, sizeof(CmcProp) * cap); memcpy(np, props, cnt * sizeof(CmcProp)); props = np; }
+                    props[cnt].key = NULL; props[cnt].computed = 0; props[cnt].spread = 1;
+                    props[cnt].value = parse_expr(p, 2);
+                    cnt++;
+                    if (!accept(p, TK_COMMA)) break;
+                    continue;
+                }
                 const char *key = NULL; int computed = 0;
                 if (check(p, TK_IDENT) || p->cur.kind == TK_STR || p->cur.kind == TK_NUM) {
                     if (p->cur.kind == TK_IDENT) key = ident_name(p);
@@ -553,6 +565,16 @@ static CmcNode *parse_for(Parser *p) {
     if (check(p, TK_OF)) {
         next(p);
         n->kind = N_FOROF;
+        n->left = n->init->stmts[0]->lhs;
+        n->test = parse_expr(p, 2);
+        expect(p, TK_RPAREN);
+        n->stmt = parse_stmt(p);
+        return n;
+    }
+    /* detect for-in: `for (var k in obj)` */
+    if (check(p, TK_IN)) {
+        next(p);
+        n->kind = N_FORIN;
         n->left = n->init->stmts[0]->lhs;
         n->test = parse_expr(p, 2);
         expect(p, TK_RPAREN);

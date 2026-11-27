@@ -66,9 +66,34 @@ The DLL exports `mbjs_init_module` (the MochiBerry ABI) and binds
 
 ## Examples
 
-`examples/` contains 7 programs that are verified to produce **byte-for-byte
+`examples/` contains 10 programs that are verified to produce **byte-for-byte
 identical output to node** (`make check` + a diff against `node file.js`):
-`hello`, `math`, `strings`, `objects`, `arrays`, `control`, `fib`.
+`hello`, `math`, `strings`, `objects`, `arrays`, `control`, `fib` (the core 7)
+plus `ecma2020`, `ecma_arrays`, `forin` (ECMA-2020+ extension).
+
+### ECMA-2020+ extension coverage
+
+Beyond ES2015/ES6, the C99 emitter also lowers:
+
+- **Logical assignment** `||=` `&&=` `??=` (ternary/null-guard lowering).
+- **Optional chaining** `?.` and **nullish coalescing** `??` (short-circuit, no
+  wrapper objects).
+- **Numeric separators** `1_000_000` / `0xFF_FF`.
+- **Optional catch binding** `catch {}` (no binding) and `catch (e)`.
+- **Default params** `(a, b = 10) => ...` (nullish-guarded `has_b`).
+- **String methods** `includes`/`startsWith`/`endsWith`/`slice`/`replace`/
+  `split`/`indexOf` (lowered to `mochi_*` runtime helpers).
+- **Array methods** `map`/`filter`/`reduce`/`forEach` with an **inline arrow**:
+  the callback body is inlined into a C loop — **no closure, no indirect call,
+  no function pointer**.
+- **`for...in`** over an object: keys materialized into a compile-time
+  `const char *keys[]` field list, looped in C.
+- **`true`/`false`** printed as words (not `1`/`0`).
+
+Known limits (documented, not silently wrong): object spread `{...src}` and
+call spread `f(...arr)` are accepted by the parser but not yet merged/lowered;
+`obj[key]` with a *runtime* string key is not supported; the exception model is
+best-effort (no unwinding).
 
 ## Layout
 
@@ -77,15 +102,17 @@ ccompiler/   C99 pipeline: cmochi.h, lex.c, parse.c, ir.c, emit.c, main.c
 runtime/     cmochicode_rt.h (micro-runtime) + mochi.h/mochi_gc.h (GC wiring)
 native/      cmochicode_module.c — MochiBerry native module source
 mochi_modules/  built cmochicode.dll + test_native.mjs
-examples/    7 verified JS->C examples
+examples/    10 verified JS->C examples
 src/         legacy acorn JS->C codegen (reference oracle; not the C99 path)
 ```
 
 ## Status
 
-- C99 native pipeline is **green**: all 7 examples transpile, compile with
+- C99 native pipeline is **green**: all 10 examples transpile, compile with
   `gcc -O2 -s -lm`, and match node output exactly.
 - The MochiBerry native module (`mochi_modules/cmochicode.dll`) works: it
   compiles JS → C inside MochiBerry, and the emitted C compiles + runs and
   matches node.
 - Compiler binary `cmochi.exe` ≈ **132 KB** (target < 200 KB).
+- The generated C is C99-safe against **trigraphs** (`??=` etc. in literals
+  are emitted as `\x3f`, so `-std=c99` never mangles them).

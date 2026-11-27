@@ -73,7 +73,8 @@ typedef enum {
     TK_PLUS, TK_MINUS, TK_STAR, TK_SLASH, TK_PERCENT, TK_STARSTAR,
     TK_EQ, TK_PLUSEQ, TK_MINUSEQ, TK_STAREQ, TK_SLASHEQ, TK_PERCENTEQ,
     TK_STARSTAREQ, TK_EQEQ, TK_EQEQEQ, TK_NE, TK_NEEQ, TK_LT, TK_LE,
-    TK_GT, TK_GE, TK_ANDAND, TK_OROR, TK_NULLISH, TK_QMARKDOT,
+    TK_GT, TK_GE,    TK_ANDAND, TK_OROR, TK_NULLISH, TK_QMARKDOT,
+    TK_ANDANDEQ, TK_OROREQ, TK_NULLISHEQ,
     TK_AND, TK_OR, TK_XOR, TK_NOT, TK_TILDE, TK_SHL, TK_SHR, TK_SHRU,
     TK_ANDEQ, TK_OREQ, TK_XOREQ, TK_SHLEQ, TK_SHREQ, TK_SHRUEQ,
     TK_PLUSPLUS, TK_MINUSMINUS,
@@ -111,6 +112,7 @@ typedef enum {
     N_ARR, N_OBJ, N_TEMPLATE, N_ARROW, N_SEQ, N_NULLISH, N_QMARKDOT,
     N_VAR, N_FUNC, N_IF, N_WHILE, N_DOWHILE, N_FOR, N_FOROF, N_RETURN,
     N_BREAK, N_CONTINUE, N_BLOCK, N_SWITCH, N_EXPRSTMT, N_THROW, N_TRY,
+    N_FORIN,
     N_DESTRUCT_OBJ, N_DESTRUCT_ARR, N_THIS,
 } CmcNodeKind;
 
@@ -172,6 +174,7 @@ struct CmcProp {
     const char *key;
     CmcNode    *value;
     int         computed;
+    int         spread;   /* 1 = spread `...src` — value is the spread source */
 };
 
 /* ------------------------------------------------------------------ */
