@@ -9,6 +9,11 @@ typedef struct {
     CmcToken  cur;
     CmcArena *arena;
     int       err;
+    /* parse-time table of const string bindings: lets `{ [k]: v }` name a
+     * real field when k is a compile-time constant string. */
+    const char *cs_name[64];
+    const char *cs_val[64];
+    int       cs_n;
 } Parser;
 
 static CmcNode *new_node(Parser *p, CmcNodeKind k) {
@@ -33,6 +38,39 @@ static const char *ident_name(Parser *p) {
     const char *s = cmc_arena_strndup(p->arena, p->cur.text.ptr, p->cur.text.len);
     next(p);
     return s;
+}
+
+static void p_cstr_set(Parser *p, const char *name, const char *val) {
+    for (int i = 0; i < p->cs_n; i++)
+        if (strcmp(p->cs_name[i], name) == 0) { p->cs_val[i] = val; return; }
+    if (p->cs_n >= 64) return;
+    p->cs_name[p->cs_n] = name;
+    p->cs_val[p->cs_n] = val;
+    p->cs_n++;
+}
+
+/* fold an expression to a compile-time constant string, or NULL */
+static const char *p_fold_str(Parser *p, CmcNode *n) {
+    if (!n) return NULL;
+    if (n->kind == N_STR) return n->str;
+    if (n->kind == N_IDENT) {
+        for (int i = 0; i < p->cs_n; i++)
+            if (strcmp(p->cs_name[i], n->name) == 0) return p->cs_val[i];
+        return NULL;
+    }
+    if (n->kind == N_BIN && n->op == TK_PLUS) {
+        const char *l = p_fold_str(p, n->lhs);
+        if (!l) return NULL;
+        const char *r = p_fold_str(p, n->rhs);
+        if (!r) return NULL;
+        size_t ln = strlen(l), rn = strlen(r);
+        char *buf = (char *)cmc_arena_alloc(p->arena, ln + rn + 1);
+        memcpy(buf, l, ln);
+        memcpy(buf + ln, r, rn);
+        buf[ln + rn] = 0;
+        return buf;
+    }
+    return NULL;
 }
 
 /* ------- expression forward decls ------- */
@@ -258,7 +296,8 @@ static CmcNode *parse_primary(Parser *p) {
                     computed = 1;
                     next(p);
                     CmcNode *ke = parse_expr(p, 2);
-                    key = ke && ke->kind == N_STR ? ke->str : "?";
+                    key = p_fold_str(p, ke);
+                    if (!key) key = "?";
                     expect(p, TK_RBRACKET);
                 }
                 if (accept(p, TK_COLON)) {
@@ -579,6 +618,10 @@ static CmcNode *parse_var_decl(Parser *p, CmcNodeKind kind) {
         if (accept(p, TK_EQ)) init = parse_expr(p, 2);
         CmcNode *d = new_node(p, N_ASSIGN);
         d->lhs = id; d->rhs = init; d->op = kind; /* reuse op to carry var kind */
+        if (id && id->kind == N_IDENT && init) {
+            const char *sv = p_fold_str(p, init);
+            if (sv) p_cstr_set(p, id->name, sv);
+        }
         if (cnt == cap) { cap *= 2; CmcNode **np = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * cap); memcpy(np, decls, cnt * sizeof(CmcNode *)); decls = np; }
         decls[cnt++] = d;
         if (!accept(p, TK_COMMA)) break;
@@ -821,6 +864,7 @@ static CmcNode *parse_stmt(Parser *p) {
 
 CmcNode *cmc_parse(CmcCtx *ctx, const char *src, size_t len) {
     Parser p;
+    memset(&p, 0, sizeof p);
     cmc_lex_init(&p.lx, src, len, ctx->arena);
     p.arena = ctx->arena;
     p.err = 0;

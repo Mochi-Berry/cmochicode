@@ -276,3 +276,91 @@ void emit_console(Emit *em, CmcNode **args, int nargs, int to_stderr) {
 }
 
 /* ---------------------- expressions ---------------------- */
+
+/* ---------------------- compile-time constant string folding ----------------------
+ * Supports `obj[key]` / `{ [key]: v }` when the key is knowable at compile time:
+ * a string literal, a const-string binding, a "a" + "b" concat, or a template
+ * with fully static parts. Dynamic runtime keys stay unsupported (struct model).
+ */
+static void cstr_set(Emit *em, const char *name, const char *val) {
+    for (int i = 0; i < em->cstr_n; i++) {
+        if (strcmp(em->cstr_name[i], name) == 0) { em->cstr_val[i] = val; return; }
+    }
+    if (em->cstr_n >= 64) return;
+    em->cstr_name[em->cstr_n] = name;
+    em->cstr_val[em->cstr_n] = val;
+    em->cstr_n++;
+}
+
+const char *kfold(Emit *em, CmcNode *n) {
+    if (!n) return NULL;
+    switch (n->kind) {
+        case N_STR:
+            return n->str;
+        case N_IDENT:
+            for (int i = 0; i < em->cstr_n; i++)
+                if (strcmp(em->cstr_name[i], n->name) == 0) return em->cstr_val[i];
+            return NULL;
+        case N_BIN: {
+            if (n->op != TK_PLUS) return NULL;
+            const char *l = kfold(em, n->lhs);
+            if (!l) return NULL;
+            const char *r = kfold(em, n->rhs);
+            if (!r) return NULL;
+            size_t ln = strlen(l), rn = strlen(r);
+            char *buf = (char *)cmc_arena_alloc(em->ctx->arena, ln + rn + 1);
+            memcpy(buf, l, ln);
+            memcpy(buf + ln, r, rn);
+            buf[ln + rn] = 0;
+            return buf;
+        }
+        case N_TEMPLATE: {
+            /* only static quasis (no substitutions) fold */
+            if (n->nexprs > 0) return NULL;
+            size_t cap = 16, len = 0;
+            char *buf = (char *)cmc_arena_alloc(em->ctx->arena, cap);
+            for (int i = 0; i < n->nquasis; i++) {
+                const char *q = n->quasis[i] ? n->quasis[i]->str : "";
+                size_t ql = strlen(q);
+                if (len + ql + 1 > cap) {
+                    size_t nc = (len + ql + 1) * 2;
+                    char *nb = (char *)cmc_arena_alloc(em->ctx->arena, nc);
+                    memcpy(nb, buf, len);
+                    buf = nb; cap = nc;
+                }
+                memcpy(buf + len, q, ql); len += ql;
+            }
+            buf[len] = 0;
+            return buf;
+        }
+        default:
+            return NULL;
+    }
+}
+
+void collect_cstr(Emit *em, CmcNode *n) {
+    if (!n) return;
+    if (n->kind == N_VAR) {
+        for (int i = 0; i < n->nstmts; i++) {
+            CmcNode *d = n->stmts[i];
+            if (!d || d->kind != N_ASSIGN || !d->lhs || d->lhs->kind != N_IDENT) continue;
+            const char *v = kfold(em, d->rhs);
+            if (v) cstr_set(em, d->lhs->name, v);
+        }
+    }
+    if (n->kind == N_ASSIGN && n->lhs && n->lhs->kind == N_IDENT) {
+        const char *v = kfold(em, n->rhs);
+        if (v) cstr_set(em, n->lhs->name, v);
+    }
+    collect_cstr(em, n->obj); collect_cstr(em, n->prop);
+    collect_cstr(em, n->lhs); collect_cstr(em, n->rhs); collect_cstr(em, n->third);
+    collect_cstr(em, n->body); collect_cstr(em, n->init); collect_cstr(em, n->test);
+    collect_cstr(em, n->update); collect_cstr(em, n->stmt);
+    for (int i = 0; i < n->nargs; i++) collect_cstr(em, n->args[i]);
+    for (int i = 0; i < n->nelems; i++) collect_cstr(em, n->elems[i]);
+    for (int i = 0; i < n->nprops; i++) collect_cstr(em, n->props[i].value);
+    for (int i = 0; i < n->nstmts; i++) collect_cstr(em, n->stmts[i]);
+    for (int i = 0; i < n->nquasis; i++) collect_cstr(em, n->quasis[i]);
+    for (int i = 0; i < n->nexprs; i++) collect_cstr(em, n->exprs[i]);
+    for (int i = 0; i < n->nparams; i++) collect_cstr(em, n->params[i]);
+}

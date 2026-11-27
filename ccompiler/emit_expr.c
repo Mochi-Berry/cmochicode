@@ -32,23 +32,7 @@ EStr emit_ident(Emit *em, CmcNode *n) {
     return estr(n->name, CT_UNKNOWN, 0, 0, NULL);
 }
 
-EStr emit_member(Emit *em, CmcNode *n) {
-    EStr o = emit_expr(em, n->obj);
-    if (n->computed) {
-        EStr idx = emit_expr(em, n->prop);
-        Buf b; b_init(&b);
-        if (o.type == CT_ARR) {
-            b_putf(&b, "mochi_array_get(%s, %s)", o.code, idx.code);
-            return estr(b.s, CT_MOCHI_VAL, 0, 0, NULL);
-        }
-        if (o.type == CT_STR) {
-            b_putf(&b, "mochi_char_at(%s, %s)", o.code, idx.code);
-            return estr(b.s, CT_STR, 0, 1, NULL);
-        }
-        b_putf(&b, "%s", o.code);
-        return estr(b.s, CT_UNKNOWN, o.escapes, o.ptr, NULL);
-    }
-    const char *prop = n->prop ? n->prop->name : "";
+EStr emit_member_field(Emit *em, EStr o, CmcNode *obj_node, const char *prop, int optional) {
     if (o.type == CT_ARR && strcmp(prop, "length") == 0) {
         Buf b; b_init(&b);
         b_putf(&b, "(int)(%s%slen)", o.code, o.ptr ? "->" : ".");
@@ -61,8 +45,8 @@ EStr emit_member(Emit *em, CmcNode *n) {
             return estr(b.s, CT_INT, 0, 0, NULL);
         }
         /* function.length: params before the first default / rest */
-        if (strcmp(prop, "length") == 0 && n->obj->kind == N_IDENT) {
-            CmcSym *s = cmc_env_lookup(&em->env, n->obj->name);
+        if (strcmp(prop, "length") == 0 && obj_node && obj_node->kind == N_IDENT) {
+            CmcSym *s = cmc_env_lookup(&em->env, obj_node->name);
             if (s && s->kind == SYM_FUNC && s->func_node) {
                 int cnt = 0;
                 for (int i = 0; i < s->func_node->nparams; i++) {
@@ -89,7 +73,7 @@ EStr emit_member(Emit *em, CmcNode *n) {
         else if (strcmp(ft, "mochi_array *") == 0) t = CT_ARR;
         else t = CT_UNKNOWN;
         /* optional chaining `user?.id`: yield 0/NULL instead of crashing */
-        if (n->optional) {
+        if (optional) {
             Buf w; b_init(&w);
             if (t == CT_STR) b_putf(&w, "(%s != NULL ? %s : NULL)", o.code, b.s);
             else if (t == CT_ARR) b_putf(&w, "(%s != NULL ? %s : NULL)", o.code, b.s);
@@ -103,6 +87,35 @@ EStr emit_member(Emit *em, CmcNode *n) {
     member_base(em, &b, o);
     b_put(&b, prop);
     return estr(b.s, CT_UNKNOWN, o.escapes, o.ptr, NULL);
+}
+
+EStr emit_member(Emit *em, CmcNode *n) {
+    EStr o = emit_expr(em, n->obj);
+    if (n->computed) {
+        EStr idx = emit_expr(em, n->prop);
+        if (o.type == CT_ARR) {
+            Buf b; b_init(&b);
+            b_putf(&b, "mochi_array_get(%s, %s)", o.code, idx.code);
+            return estr(b.s, CT_MOCHI_VAL, 0, 0, NULL);
+        }
+        if (o.type == CT_STR) {
+            Buf b; b_init(&b);
+            b_putf(&b, "mochi_char_at(%s, %s)", o.code, idx.code);
+            return estr(b.s, CT_STR, 0, 1, NULL);
+        }
+        /* object + compile-time constant key -> static field access */
+        if (o.type == CT_OBJ) {
+            const char *k = kfold(em, n->prop);
+            if (k) return emit_member_field(em, o, n->obj, k, n->optional);
+            fprintf(stderr, "cmochi:%d:%d: warning: dynamic computed key on object unsupported\n", n->line, n->col);
+            return estr("0", CT_UNKNOWN, 0, 0, NULL);
+        }
+        Buf b; b_init(&b);
+        b_putf(&b, "%s", o.code);
+        return estr(b.s, CT_UNKNOWN, o.escapes, o.ptr, NULL);
+    }
+    const char *prop = n->prop ? n->prop->name : "";
+    return emit_member_field(em, o, n->obj, prop, n->optional);
 }
 
 EStr emit_bin(Emit *em, CmcNode *n) {
@@ -225,6 +238,30 @@ EStr emit_unary(Emit *em, CmcNode *n) {
     }
 }
 
+static void emit_member_assign(Emit *em, Buf *b, EStr o, const char *prop, EStr r) {
+    Buf base; b_init(&base); member_base(em, &base, o);
+    Buf rv; b_init(&rv);
+    const char *ft = o.struct_name ? cmc_struct_field_type(o.struct_name, prop) : NULL;
+    if (!ft && o.struct_name) {
+        /* JS allows point.label = "P" on a shape that only had {x, y}:
+         * merge the field into the registered shape so the struct def
+         * (emitted at assembly) grows to include it. */
+        CmcType vt = r.type;
+        if (vt == CT_UNKNOWN) vt = CT_DOUBLE;
+        cmc_shape_add_field(o.struct_name, prop, vt);
+        ft = cmc_struct_field_type(o.struct_name, prop);
+    }
+    if (ft && strcmp(ft, "const char *") == 0) co_str(em, &rv, r);
+    else if (ft && strcmp(ft, "int") == 0) co_int(&rv, r);
+    else if (ft && strcmp(ft, "int64_t") == 0) { if (r.type == CT_INT64) b_put(&rv, r.code); else b_putf(&rv, "(int64_t)(%s)", r.code); }
+    else if (ft && strcmp(ft, "double") == 0) co_num(em, &rv, r);
+    else if (r.type == CT_STR) co_str(em, &rv, r);
+    else if (cmc_is_numeric(r.type)) co_num(em, &rv, r);
+    else b_put(&rv, r.code);
+    b_putf(b, "%s%s = %s", base.s, prop, rv.s);
+    free(base.s); free(rv.s);
+}
+
 EStr emit_assign(Emit *em, CmcNode *n) {
     EStr r = emit_expr(em, n->rhs);
     Buf b; b_init(&b);
@@ -274,33 +311,22 @@ EStr emit_assign(Emit *em, CmcNode *n) {
         EStr o = emit_expr(em, m->obj);
         if (m->computed) {
             EStr idx = emit_expr(em, m->prop);
+            /* object + compile-time constant key -> static field assignment */
+            if (o.type == CT_OBJ) {
+                const char *k = kfold(em, m->prop);
+                if (k) {
+                    emit_member_assign(em, &b, o, k, r);
+                    return estr(b.s, CT_UNKNOWN, 0, 0, NULL);
+                }
+                fprintf(stderr, "cmochi:%d:%d: warning: dynamic computed key on object unsupported\n", m->line, m->col);
+                return estr("0", CT_UNKNOWN, 0, 0, NULL);
+            }
             Buf v; b_init(&v); co_box(&v, r);
             b_putf(&b, "mochi_array_set(%s, %s, %s)", o.code, idx.code, v.s);
             free(v.s);
             return estr(b.s, CT_MOCHI_VAL, 0, 0, NULL);
         }
-        const char *prop = m->prop->name;
-        Buf base; b_init(&base); member_base(em, &base, o);
-        Buf rv; b_init(&rv);
-        const char *ft = o.struct_name ? cmc_struct_field_type(o.struct_name, prop) : NULL;
-        if (!ft && o.struct_name) {
-            /* JS allows point.label = "P" on a shape that only had {x, y}:
-             * merge the field into the registered shape so the struct def
-             * (emitted at assembly) grows to include it. */
-            CmcType vt = r.type;
-            if (vt == CT_UNKNOWN) vt = CT_DOUBLE;
-            cmc_shape_add_field(o.struct_name, prop, vt);
-            ft = cmc_struct_field_type(o.struct_name, prop);
-        }
-        if (ft && strcmp(ft, "const char *") == 0) co_str(em, &rv, r);
-        else if (ft && strcmp(ft, "int") == 0) co_int(&rv, r);
-        else if (ft && strcmp(ft, "int64_t") == 0) { if (r.type == CT_INT64) b_put(&rv, r.code); else b_putf(&rv, "(int64_t)(%s)", r.code); }
-        else if (ft && strcmp(ft, "double") == 0) co_num(em, &rv, r);
-        else if (r.type == CT_STR) co_str(em, &rv, r);
-        else if (cmc_is_numeric(r.type)) co_num(em, &rv, r);
-        else b_put(&rv, r.code);
-        b_putf(&b, "%s%s = %s", base.s, prop, rv.s);
-        free(base.s); free(rv.s);
+        emit_member_assign(em, &b, o, m->prop->name, r);
         return estr(b.s, CT_UNKNOWN, 0, 0, NULL);
     }
     b_put(&b, r.code);

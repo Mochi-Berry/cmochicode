@@ -11,6 +11,7 @@ char *cmc_emit(CmcCtx *ctx, CmcNode *program) {
     b_init(&em.out);
     b_init(&em.structs);
     b_init(&em.pre);
+    collect_cstr(&em, program);
 
     int nfns = 0, nmain = 0, ncls = 0;
         CmcNode **fns = (CmcNode **)malloc(sizeof(CmcNode *) * (program->nstmts ? program->nstmts : 1));
