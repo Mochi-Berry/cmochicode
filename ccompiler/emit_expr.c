@@ -480,7 +480,14 @@ EStr emit_object(Emit *em, CmcNode *n) {
         CmcProp *pr = &n->props[i];
         if (!pr->spread) continue;
         const char *ss = vals[i].struct_name;
-        if (!ss) continue; /* unknown source type: cannot merge */
+        if (!ss) {
+            /* unknown source type: its fields cannot be enumerated statically.
+               Warn loudly instead of silently dropping the spread. */
+            fprintf(stderr, "cmochi:%d:%d: warning: object spread source has no static shape "
+                            "(fields not copied); give the source a literal/object type\n",
+                    n->line, n->col);
+            continue;
+        }
         for (int f = 0; f < 64; f++) {
             const char *fn = cmc_struct_field_name_n(ss, f);
             if (!fn) break;
@@ -495,7 +502,7 @@ EStr emit_object(Emit *em, CmcNode *n) {
             CmcProp *pr = &n->props[i];
             if (pr->spread) {
                 const char *ss = vals[i].struct_name;
-                if (!ss) continue;
+                if (!ss) continue;   /* already warned in the merge loop */
                 for (int f = 0; f < 64 && on < 64; f++) {
                     const char *fn = cmc_struct_field_name_n(ss, f);
                     if (!fn) break;
@@ -523,7 +530,7 @@ EStr emit_object(Emit *em, CmcNode *n) {
         CmcProp *pr = &n->props[i];
         if (pr->spread) {
             const char *ss = vals[i].struct_name;
-            if (!ss) continue;
+            if (!ss) continue;   /* already warned in the merge loop */
             for (int f = 0; f < 64; f++) {
                 const char *fn = cmc_struct_field_name_n(ss, f);
                 if (!fn) break;
