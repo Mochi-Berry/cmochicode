@@ -57,6 +57,10 @@ typedef struct {
     /* exception handling (best-effort, no unwinding) */
     int       try_depth;
     const char *last_thrown;
+    /* object shorthand methods: field -> lifted static fn name (per shape) */
+    const char *m_shape[64]; const char *m_field[64]; const char *m_fn[64];
+    CmcNode   *m_node[64];
+    int         m_n;
 } Emit;
 
 static EStr estr(const char *code, CmcType t, int esc, int ptr, const char *sn) {
@@ -621,7 +625,10 @@ static EStr emit_object(Emit *em, CmcNode *n) {
     /* emit all values first so spread sources reveal their struct_name */
     EStr *vals = (EStr *)malloc(sizeof(EStr) * (np ? np : 1));
     for (int i = 0; i < np; i++) vals[i] = (n->props[i].key == NULL && !n->props[i].spread)
-        ? estr("0", CT_UNKNOWN, 0, 0, NULL) : emit_expr(em, n->props[i].value);
+        ? estr("0", CT_UNKNOWN, 0, 0, NULL)
+        : (n->props[i].value && (n->props[i].value->kind == N_ARROW || n->props[i].value->kind == N_FUNC))
+        ? estr("0", CT_UNKNOWN, 0, 0, NULL) /* method: lifted in the prop loop */
+        : emit_expr(em, n->props[i].value);
     /* register the base shape (spread props skipped inside register_shape) */
     const char *sn = cmc_register_shape(em->ctx->arena, n);
     /* merge spread sources' fields into the shape, in prop order */
@@ -665,6 +672,8 @@ static EStr emit_object(Emit *em, CmcNode *n) {
     b_putf(&alloc, "struct %s *%s = (struct %s *)CMC_ALLOC(sizeof(struct %s));", sn, obj, sn, sn);
     e_preline(em, alloc.s);
     free(alloc.s);
+    /* flush pending pre-lines now: a lifted method fn must not capture them */
+    flush_pre(em);
     /* copy spread source fields, then literal props (later wins) */
     for (int i = 0; i < np; i++) {
         CmcProp *pr = &n->props[i];
@@ -686,6 +695,18 @@ static EStr emit_object(Emit *em, CmcNode *n) {
             continue;
         }
         if (pr->key == NULL) continue;
+        if (pr->value && (pr->value->kind == N_ARROW || pr->value->kind == N_FUNC)) {
+            /* shorthand method: lift to a static fn, record the inline mapping */
+            EStr fe = emit_expr(em, pr->value);
+            if (em->m_n < 64) {
+                em->m_shape[em->m_n] = sn;
+                em->m_field[em->m_n] = pr->key;
+                em->m_fn[em->m_n] = fe.code;
+                em->m_node[em->m_n] = pr->value;
+                em->m_n++;
+            }
+            continue; /* no struct field assignment; calls are inlined */
+        }
         Buf v; b_init(&v);
         const char *ft = cmc_struct_field_type(sn, pr->key);
         if (!ft) ft = "double";
@@ -994,6 +1015,31 @@ static EStr emit_call(Emit *em, CmcNode *n) {
         CmcNode *m = callee;
         EStr o = emit_expr(em, m->obj);
         const char *prop = m->prop ? m->prop->name : "";
+        /* object shorthand method call: inline the lifted static fn */
+        if (o.struct_name) {
+            for (int mi = 0; mi < em->m_n; mi++) {
+                if (strcmp(em->m_shape[mi], o.struct_name) == 0 && strcmp(em->m_field[mi], prop) == 0) {
+                    Buf mb; b_init(&mb);
+                    b_putf(&mb, "%s(", em->m_fn[mi]);
+                    CmcNode *mfn = em->m_node[mi];
+                    int np_ = mfn && mfn->nparams ? mfn->nparams : 0;
+                    for (int i = 0; i < np_; i++) {
+                        if (i) b_put(&mb, ", ");
+                        if (i < n->nargs) {
+                            EStr ae = emit_expr(em, n->args[i]);
+                            b_put(&mb, "1, "); /* arg present -> has_X=1 */
+                            if (ae.type == CT_STR) co_str(em, &mb, ae);
+                            else co_num(em, &mb, ae);
+                        } else {
+                            b_put(&mb, "0, 0"); /* omitted -> has_X=0, value 0 */
+                        }
+                    }
+                    b_put(&mb, ")");
+                    EStr r = estr(mb.s, CT_INT, 0, 0, NULL);
+                    return r;
+                }
+            }
+        }
         if (m->obj->kind == N_IDENT && strcmp(m->obj->name, "console") == 0) {
             int stderr_ = strcmp(prop, "error") == 0 || strcmp(prop, "warn") == 0;
             emit_console(em, n->args, n->nargs, stderr_);

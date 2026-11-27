@@ -255,6 +255,28 @@ static CmcNode *parse_primary(Parser *p) {
                     props[cnt].computed = computed;
                     props[cnt].value = parse_expr(p, 2);
                     cnt++;
+                } else if (check(p, TK_LPAREN)) {
+                    /* shorthand method { f() { ... } } — lower to an arrow fn */
+                    if (cnt == cap) { cap *= 2; CmcProp *np = (CmcProp *)cmc_arena_alloc(p->arena, sizeof(CmcProp) * cap); memcpy(np, props, cnt * sizeof(CmcProp)); props = np; }
+                    props[cnt].key = key; props[cnt].computed = computed;
+                    CmcNode *fn = new_node(p, N_ARROW);
+                    fn->is_expr_body = 0;
+                    /* parse ( params ) { body } as a normal function */
+                    expect(p, TK_LPAREN);
+                    int pcap = 4, pcnt = 0;
+                    CmcNode **params = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * pcap);
+                    while (!check(p, TK_RPAREN)) {
+                        CmcNode *param = parse_binding_target(p);
+                        if (accept(p, TK_EQ)) { CmcNode *def = new_node(p, N_ASSIGN); def->lhs = param; def->rhs = parse_expr(p, 2); param = def; }
+                        if (pcnt == pcap) { pcap *= 2; CmcNode **np = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * pcap); memcpy(np, params, pcnt * sizeof(CmcNode *)); params = np; }
+                        params[pcnt++] = param;
+                        if (!accept(p, TK_COMMA)) break;
+                    }
+                    expect(p, TK_RPAREN);
+                    fn->params = params; fn->nparams = pcnt;
+                    fn->body = parse_block(p);
+                    props[cnt].value = fn;
+                    cnt++;
                 } else {
                     /* shorthand {a} */
                     if (cnt == cap) { cap *= 2; CmcProp *np = (CmcProp *)cmc_arena_alloc(p->arena, sizeof(CmcProp) * cap); memcpy(np, props, cnt * sizeof(CmcProp)); props = np; }
