@@ -65,6 +65,73 @@ void uninit_prepass(Emit *em, CmcNode *block) {
 
 /* ---------------------- statements ---------------------- */
 
+/* names assigned (or updated) inside any try/catch subtree of this function.
+ * Per C rules, an automatic object modified between setjmp and longjmp has an
+ * indeterminate value afterwards unless it is volatile — so these locals must
+ * live in memory, not in a register, or the catch branch reads a stale value. */
+static void vol_collect_assign(CmcNode *n, const char **names, int *cnt) {
+    if (!n) return;
+    switch (n->kind) {
+        case N_ASSIGN:
+            if (n->lhs && n->lhs->kind == N_IDENT) {
+                for (int i = 0; i < *cnt; i++) if (strcmp(names[i], n->lhs->name) == 0) break;
+                if (*cnt < 64) {
+                    int dup = 0; for (int i = 0; i < *cnt; i++) if (strcmp(names[i], n->lhs->name) == 0) dup = 1;
+                    if (!dup) names[(*cnt)++] = n->lhs->name;
+                }
+            }
+            vol_collect_assign(n->lhs, names, cnt);
+            vol_collect_assign(n->rhs, names, cnt);
+            return;
+        case N_UPDATE:
+            if (n->lhs && n->lhs->kind == N_IDENT && *cnt < 64) {
+                int dup = 0; for (int i = 0; i < *cnt; i++) if (strcmp(names[i], n->lhs->name) == 0) dup = 1;
+                if (!dup) names[(*cnt)++] = n->lhs->name;
+            }
+            return;
+        case N_BLOCK: for (int i = 0; i < n->nstmts; i++) vol_collect_assign(n->stmts[i], names, cnt); return;
+        case N_IF:  vol_collect_assign(n->test, names, cnt); vol_collect_assign(n->cons, names, cnt); vol_collect_assign(n->alt, names, cnt); return;
+        case N_WHILE: case N_DOWHILE: case N_FOROF:
+            vol_collect_assign(n->test, names, cnt); vol_collect_assign(n->stmt, names, cnt); return;
+        case N_FOR:
+            vol_collect_assign(n->init, names, cnt); vol_collect_assign(n->test, names, cnt);
+            vol_collect_assign(n->update, names, cnt); vol_collect_assign(n->stmt, names, cnt); return;
+        case N_VAR: for (int i = 0; i < n->nstmts; i++) vol_collect_assign(n->stmts[i], names, cnt); return;
+        case N_EXPRSTMT: vol_collect_assign(n->lhs, names, cnt); return;
+        case N_RETURN: vol_collect_assign(n->lhs, names, cnt); return;
+        case N_CALL:
+            if (n->obj) vol_collect_assign(n->obj, names, cnt);
+            for (int i = 0; i < n->nargs; i++) vol_collect_assign(n->args[i], names, cnt);
+            return;
+        case N_MEMBER: vol_collect_assign(n->obj, names, cnt); return;
+        case N_TRY:  vol_collect_assign(n->stmt, names, cnt); vol_collect_assign(n->alt, names, cnt); return;
+        case N_FUNC: case N_CLASS: case N_ARROW: return;  /* separate function, own frame */
+        default: return;
+    }
+}
+void vol_pass(Emit *em, CmcNode *block) {
+    em->vol_n = 0;
+    vol_collect_assign(block, em->vol_names, &em->vol_n);
+}
+static int is_vol(Emit *em, const char *name) {
+    for (int i = 0; i < em->vol_n; i++) if (strcmp(em->vol_names[i], name) == 0) return 1;
+    return 0;
+}
+/* the declaration type text for a volatile local (NULL = not volatile) */
+static char *vol_decl_type(Emit *em, const char *name, CmcType t, const char *sname) {
+    if (!name || !is_vol(em, name)) return NULL;
+    if (t == CT_STR) { char *r = malloc(32); strcpy(r, "const char * volatile"); return r; }
+    if (t == CT_ARR) { char *r = malloc(32); strcpy(r, "mochi_array * volatile"); return r; }
+    if (t == CT_OBJ || t == CT_NULL || t == CT_UNDEF) {
+        Buf b; b_init(&b);
+        if (t == CT_OBJ && sname) b_putf(&b, "struct %s * volatile", sname); else b_put(&b, "void * volatile");
+        return b.s;
+    }
+    Buf b; b_init(&b);
+    b_putf(&b, "volatile %s", cmc_type_name(t));
+    return b.s;
+}
+
 void emit_var_decl(Emit *em, CmcNode *n) {
     for (int i = 0; i < n->nstmts; i++) {
         CmcNode *d = n->stmts[i];
@@ -121,7 +188,9 @@ void emit_var_decl(Emit *em, CmcNode *n) {
         if (d->rhs == NULL) {
             CmcType t = uninit_type(em, name);
             cmc_env_decl(&em->env, name, t, SYM_LOCAL);
-            if (t == CT_STR) e_linef(em, "const char *%s = NULL;", name);
+            char *va = vol_decl_type(em, name, t, NULL);
+            if (va) { e_linef(em, "%s %s = %s;", va, name, t == CT_STR ? "NULL" : (t == CT_OBJ ? "NULL" : "0")); free(va); }
+            else if (t == CT_STR) e_linef(em, "const char *%s = NULL;", name);
             else e_linef(em, "double %s = 0;", name);
             continue;
         }
@@ -138,7 +207,9 @@ void emit_var_decl(Emit *em, CmcNode *n) {
         if ((d->rhs->kind == N_NULL || d->rhs->kind == N_UNDEF) && uninit_type(em, name) != CT_UNKNOWN) {
             CmcType rt = uninit_type(em, name);
             cmc_env_decl(&em->env, name, rt, SYM_LOCAL);
-            if (rt == CT_STR) e_linef(em, "const char *%s = NULL;", name);
+            char *vb = vol_decl_type(em, name, rt, NULL);
+            if (vb) { e_linef(em, "%s %s = %s;", vb, name, rt == CT_STR || rt == CT_OBJ ? "NULL" : "0"); free(vb); }
+            else if (rt == CT_STR) e_linef(em, "const char *%s = NULL;", name);
             else if (rt == CT_OBJ) e_linef(em, "void *%s = NULL;", name);
             else e_linef(em, "double %s = 0;", name);
             continue;
@@ -160,7 +231,9 @@ void emit_var_decl(Emit *em, CmcNode *n) {
             default: b_put(&r, e.code);
         }
         /* object/array values keep their concrete struct type, not void* */
-        if (t == CT_OBJ && e.struct_name)
+        char *vc = vol_decl_type(em, name, t, e.struct_name);
+        if (vc) { e_linef(em, "%s %s = %s;", vc, name, r.s); free(vc); }
+        else if (t == CT_OBJ && e.struct_name)
             e_linef(em, "struct %s * %s = %s;", e.struct_name, name, r.s);
         else
             e_linef(em, "%s %s = %s;", cmc_type_name(t), name, r.s);
@@ -217,11 +290,14 @@ void emit_for(Emit *em, CmcNode *n) {
                 if (t == CT_STR) co_str(em, &r, e);
                 else if (t == CT_BOOL) co_bool(em, &r, e);
                 else co_num(em, &r, e);
-                b_putf(&head, "%s %s = %s; ", cmc_type_name(t), d->lhs->name, r.s);
-                free(r.s);
+                char *vd = vol_decl_type(em, d->lhs->name, t, NULL);
+                b_putf(&head, "%s %s = %s; ", vd ? vd : cmc_type_name(t), d->lhs->name, r.s);
+                free(vd); free(r.s);
             } else {
                 cmc_env_decl(&em->env, d->lhs->name, CT_DOUBLE, SYM_LOCAL);
-                b_putf(&head, "double %s = 0; ", d->lhs->name);
+                char *ve = vol_decl_type(em, d->lhs->name, CT_DOUBLE, NULL);
+                b_putf(&head, "%s %s = 0; ", ve ? ve : "double", d->lhs->name);
+                free(ve);
             }
         } else {
             EStr e = emit_expr(em, n->init);
@@ -359,9 +435,13 @@ void emit_stmt(Emit *em, CmcNode *n) {
                 else if (e.type == CT_BOOL) co_bool(em, &r, e);
                 else if (cmc_is_numeric(e.type)) co_num(em, &r, e);
                 else b_put(&r, e.code);
+                for (int ti = 0; ti < em->try_depth; ti++) e_line(em, "mochi_try_pop();");
                 e_linef(em, "return %s;", r.s);
                 free(r.s);
-            } else e_line(em, "return;");
+            } else {
+                for (int ti = 0; ti < em->try_depth; ti++) e_line(em, "mochi_try_pop();");
+                e_line(em, "return;");
+            };
             break;
         }
         case N_BREAK: e_line(em, "break;"); break;
@@ -369,29 +449,43 @@ void emit_stmt(Emit *em, CmcNode *n) {
         case N_BLOCK: emit_block(em, n); break;
         case N_SWITCH: emit_switch(em, n); break;
         case N_THROW: {
+            /* real unwinding: longjmp to the innermost live try frame */
             EStr e = emit_expr(em, n->lhs);
             Buf r; b_init(&r);
             co_str(em, &r, e);
-            const char *tv = tmp_name(em, "thrown");
-            e_linef(em, "const char *%s = %s;", tv, r.s);
-            em->last_thrown = tv;
-            if (em->try_depth == 0)
-                e_linef(em, "fprintf(stderr, \"Exception: %%s\\n\", %s);", tv);
+            e_linef(em, "mochi_throw(%s);", r.s);
             free(r.s);
             break;
         }
         case N_TRY: {
+            /* try { ... } catch (e) { ... }
+             * setjmp MUST be inline here: a longjmp into a frame that has
+             * already returned is UB, so the buffer is a local of this very
+             * function and only registered with the runtime frame stack. */
+            e_linef(em, "{");
+            const char *jb = tmp_name(em, "jb");
+            e_linef(em, "MochiJmpBuf %s;", jb);
+            e_linef(em, "if (setjmp(%s) == 0) {", jb);
+            em->indent++;
+            e_linef(em, "mochi_try_push(&%s);", jb);
             em->try_depth++;
             emit_stmt(em, n->stmt);
             em->try_depth--;
+            e_line(em, "mochi_try_pop();");
+            em->indent--;
+            e_line(em, "} else {");
+            em->indent++;
+            e_line(em, "mochi_try_pop();");   /* the throw did not pop for us */
             if (n->alt) {
                 if (n->third && n->third->kind == N_IDENT) {
                     cmc_env_decl(&em->env, n->third->name, CT_STR, SYM_LOCAL);
-                    e_linef(em, "const char *%s = %s ? %s : \"\";", n->third->name,
-                            em->last_thrown ? em->last_thrown : "0", em->last_thrown ? em->last_thrown : "\"\"");
+                    e_linef(em, "const char *%s = mochi_last_thrown ? mochi_last_thrown : \"\";", n->third->name);
                 }
                 emit_stmt(em, n->alt);
             }
+            em->indent--;
+            e_line(em, "}");
+            e_line(em, "}");
             break;
         }
         case N_EXPRSTMT: {

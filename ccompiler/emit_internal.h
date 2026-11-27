@@ -29,6 +29,9 @@ typedef struct {
     int         u_n;
     int       try_depth;
     const char *last_thrown;
+    /* locals assigned inside a try/catch must be volatile: a longjmp makes
+       any auto variable modified between setjmp and longjmp indeterminate */
+    const char *vol_names[64]; int vol_n;
     const char *m_shape[64]; const char *m_field[64]; const char *m_fn[64];
     CmcNode   *m_node[64];
     int        m_guarded[64];
@@ -102,6 +105,7 @@ void uninit_collect(Emit *em, CmcNode *s);
 void uninit_resolve(Emit *em, CmcNode *s);
 void uninit_prepass(Emit *em, CmcNode *block);
 void emit_var_decl(Emit *em, CmcNode *n);
+void vol_pass(Emit *em, CmcNode *block);
 void emit_if(Emit *em, CmcNode *n);
 void emit_block(Emit *em, CmcNode *n);
 void emit_while(Emit *em, CmcNode *n);

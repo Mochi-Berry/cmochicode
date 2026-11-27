@@ -51,6 +51,12 @@ char *cmc_emit(CmcCtx *ctx, CmcNode *program) {
         mb.kind = N_BLOCK; mb.stmts = main_body; mb.nstmts = nmain;
         uninit_prepass(&em, &mb);
     }
+    /* setjmp rule: names assigned inside a try/catch must be volatile in main */
+    {
+        CmcNode vb; memset(&vb, 0, sizeof(vb));
+        vb.kind = N_BLOCK; vb.stmts = main_body; vb.nstmts = nmain;
+        vol_pass(&em, &vb);
+    }
     e_line(&em, "int main(void) {");
     em.indent++;
     if (nmain == 0) e_line(&em, "(void)0;");

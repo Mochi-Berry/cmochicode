@@ -17,6 +17,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <setjmp.h>
 
 #ifdef CMC_WITH_MOCHIBERRY
 #include "mbjs_alloc.h"
@@ -26,6 +27,36 @@
 #define CMC_ALLOC(sz) malloc((sz))
 #define CMC_FREE(p)   free((p))
 #endif
+
+/* ---------- exceptions: setjmp/longjmp unwinding ---------- */
+/* A throw longjmps to the innermost live try frame; the caught message is
+ * copied into a static buffer so it survives the unwind (the throwing frame
+ * is gone). Uncaught throws print and exit. */
+typedef jmp_buf MochiJmpBuf;   /* jmp_buf is an array type; keep it as one */
+#define MOCHI_TRY_MAX 32
+static MochiJmpBuf *mochi_try_stack[MOCHI_TRY_MAX];
+static int mochi_try_depth = 0;
+static char mochi_thrown_buf[512];
+static const char *mochi_last_thrown = 0;
+/* Register/unregister the try frame. The setjmp itself MUST live in the same
+ * function as the try body (a longjmp into a returned frame is UB), so the
+ * generated code calls setjmp inline and only registers the buffer here. */
+static void mochi_try_push(MochiJmpBuf *jb) {
+    if (mochi_try_depth < MOCHI_TRY_MAX) mochi_try_stack[mochi_try_depth++] = jb;
+}
+static void mochi_try_pop(void) { if (mochi_try_depth > 0) mochi_try_depth--; }
+static void mochi_throw(const char *msg) {
+    if (!msg) msg = "";
+    strncpy(mochi_thrown_buf, msg, sizeof(mochi_thrown_buf) - 1);
+    mochi_thrown_buf[sizeof(mochi_thrown_buf) - 1] = 0;
+    mochi_last_thrown = mochi_thrown_buf;
+    if (mochi_try_depth > 0) {
+        MochiJmpBuf *target = mochi_try_stack[mochi_try_depth - 1];
+        longjmp(*target, 1);
+    }
+    fprintf(stderr, "Exception: %s\n", mochi_thrown_buf);
+    exit(1);
+}
 
 /* ---------- tagged value + dynamic array ---------- */
 typedef struct { unsigned char t; double n; const char *s; void *p; } mochi_val;

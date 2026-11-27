@@ -630,6 +630,7 @@ EStr emit_arrow(Emit *em, CmcNode *n) {
     CmcType ret = n->is_expr_body ? cmc_type_of(em->ctx, &em->env, n->body) : CT_INT;
     if (ret == CT_UNKNOWN || ret == CT_VOID) ret = CT_INT;
 
+    vol_pass(em, n->body);
     Buf save = em->out;
     Buf body; b_init(&body);
     em->out = body;
@@ -1290,6 +1291,10 @@ CmcType fn_return_type(CmcNode *fn) {
         else if (cur->kind == N_VAR) for (int i = 0; i < cur->nstmts; i++) stack[sp++] = cur->stmts[i];
         else if (cur->kind == N_EXPRSTMT) stack[sp++] = cur->lhs;
         else if (cur->kind == N_RETURN) stack[sp++] = cur->lhs;
+        else if (cur->kind == N_TRY) { stack[sp++] = cur->stmt; stack[sp++] = cur->alt; }
+        else if (cur->kind == N_THROW) stack[sp++] = cur->lhs;
+        else if (cur->kind == N_FUNC || cur->kind == N_CLASS) { /* nested: separate scope */ }
+        else if (cur->lhs) stack[sp++] = cur->lhs;
     }
     /* expression-bodied arrow: infer from the body expression */
     if (!saw && fn->is_expr_body && fn->body) {
@@ -1367,6 +1372,7 @@ void emit_function(Emit *em, CmcNode *fn) {
         if (fn->params[i]->kind == N_IDENT) pt[i] = infer_param_type_lite(em, fn, fn->params[i]->name);
         else pt[i] = CT_DOUBLE;
     }
+    vol_pass(em, fn->body);
     cmc_env_push(&em->env, em->ctx->arena);
     Buf sig; b_init(&sig);
     b_putf(&sig, "static %s %s(", cmc_type_name(ret), fn->fname);
