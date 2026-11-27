@@ -71,6 +71,32 @@ static inline mochi_val mochi_array_pop(mochi_array *a) {
 static inline void mochi_array_set(mochi_array *a, int i, mochi_val v) {
     if (i >= 0 && i < a->len) a->items[i] = v;
 }
+static inline mochi_array *mochi_array_slice(mochi_array *a, int s, int e) {
+    mochi_array *r = mochi_array_new();
+    int n = a->len;
+    if (s < 0) s = n + s;
+    if (s < 0) s = 0;
+    if (e < 0) e = n + e;
+    if (e < 0) e = 0;
+    if (e > n) e = n;
+    for (int i = s; i < e; i++) mochi_array_push(r, a->items[i]);
+    return r;
+}
+static inline mochi_array *mochi_array_reverse(mochi_array *a) {
+    /* in place, JS-mutating semantics; returns the same array */
+    for (int i = 0, j = a->len - 1; i < j; i++, j--) {
+        mochi_val t = a->items[i]; a->items[i] = a->items[j]; a->items[j] = t;
+    }
+    return a;
+}
+static inline int mochi_array_index_of(mochi_array *a, double v) {
+    for (int i = 0; i < a->len; i++)
+        if (a->items[i].t == 0 && mochi_val_num(a->items[i]) == v) return i;
+    return -1;
+}
+static inline int mochi_array_includes(mochi_array *a, double v) {
+    return mochi_array_index_of(a, v) >= 0;
+}
 static inline const char *mochi_array_join(mochi_array *a, const char *sep) {
     size_t need = 1, sl = strlen(sep);
     for (int i = 0; i < a->len; i++) need += (a->items[i].t == 1 ? strlen(a->items[i].s) : 32) + sl;
@@ -185,6 +211,25 @@ static inline mochi_array *mochi_split(const char *s, const char *sep) {
         start = p + sl;
     }
     return a;
+}
+static inline const char *mochi_pad_start(const char *s, int len, const char *fill) {
+    const char *f = (fill && fill[0]) ? fill : " ";
+    size_t sl = strlen(s), fl = strlen(f), need = (size_t)len + 1;
+    char *out = (char *)CMC_ALLOC(need);
+    if (sl >= (size_t)len) { memcpy(out, s, sl + 1); return out; }
+    size_t k = 0;
+    while (k < (size_t)len - sl) out[k++] = f[k % fl];
+    memcpy(out + k, s, sl + 1);
+    return out;
+}
+static inline const char *mochi_pad_end(const char *s, int len, const char *fill) {
+    const char *f = (fill && fill[0]) ? fill : " ";
+    size_t sl = strlen(s), fl = strlen(f), need = (size_t)len + 1;
+    char *out = (char *)CMC_ALLOC(need);
+    memcpy(out, s, sl + 1);
+    size_t k = sl;
+    if ((size_t)len > sl) while (k < (size_t)len) out[k++] = f[(k - sl) % fl];
+    return out;
 }
 static inline double mochi_rand01(void) { return (double)rand() / (double)RAND_MAX; }
 

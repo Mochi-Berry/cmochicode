@@ -320,11 +320,25 @@ static EStr emit_member(Emit *em, CmcNode *n) {
         return estr(b.s, CT_INT, 0, 0, NULL);
     }
     if (o.type == CT_STR && strcmp(prop, "length") == 0) {
-        em->need_string = 1;
-        Buf b; b_init(&b);
-        b_putf(&b, "(int)strlen(%s)", o.code);
-        return estr(b.s, CT_INT, 0, 0, NULL);
-    }
+            em->need_string = 1;
+            Buf b; b_init(&b);
+            b_putf(&b, "(int)strlen(%s)", o.code);
+            return estr(b.s, CT_INT, 0, 0, NULL);
+        }
+        /* function.length: params before the first default / rest */
+        if (strcmp(prop, "length") == 0 && n->obj->kind == N_IDENT) {
+            CmcSym *s = cmc_env_lookup(&em->env, n->obj->name);
+            if (s && s->kind == SYM_FUNC && s->func_node) {
+                int cnt = 0;
+                for (int i = 0; i < s->func_node->nparams; i++) {
+                    CmcNode *pn = s->func_node->params[i];
+                    if (pn->is_rest || pn->kind == N_ASSIGN) break;
+                    cnt++;
+                }
+                char nb[32]; snprintf(nb, sizeof nb, "%d", cnt);
+                return estr(cmc_arena_strndup(em->ctx->arena, nb, strlen(nb)), CT_INT, 0, 0, NULL);
+            }
+        }
     if (o.type == CT_OBJ) {
         Buf b; b_init(&b);
         member_base(em, &b, o);
@@ -880,6 +894,7 @@ static EStr emit_arr_higher(Emit *em, CmcNode *n, const char *prop, EStr o) {
     char ind[16]; for (int i = 0; i < em->indent; i++) ind[i] = ' '; ind[em->indent] = 0;
     Buf out_loop; b_init(&out_loop);
     const char *result_name = NULL;
+    int result_is_bool = 0;
 
     cmc_env_push(&em->env, em->ctx->arena);
     cmc_env_decl(&em->env, pname, CT_DOUBLE, SYM_LOCAL);
@@ -901,6 +916,29 @@ static EStr emit_arr_higher(Emit *em, CmcNode *n, const char *prop, EStr o) {
         b_put(&out_loop, bodys.s);
         b_putf(&out_loop, "%s}\n", ind);
         free(bodys.s);
+    } else if (strcmp(prop, "some") == 0 || strcmp(prop, "every") == 0 || strcmp(prop, "find") == 0) {
+        char res[32]; snprintf(res, sizeof res, "__r%d", em->tmp); em->tmp++;
+        b_putf(&out_loop, "%sdouble %s = %s;\n", ind, res, (strcmp(prop, "every") == 0) ? "1" : "0");
+        b_putf(&out_loop, "%sfor (size_t %s = 0; %s < (%s)->len; %s++) {\n", ind, li, li, o.code, li);
+        b_putf(&out_loop, "%s    double %s = mochi_val_num((%s)->items[%s]);\n", ind, pname, o.code, li);
+        Buf bodyc; b_init(&bodyc);
+        if (body_node) {
+            Buf saved = em->out; em->out = bodyc;
+            EStr be = emit_expr(em, body_node);
+            em->out = saved;
+            b_put(&bodyc, be.code);
+        }
+        const char *bc = bodyc.len ? bodyc.s : "0";
+        if (strcmp(prop, "some") == 0)
+            b_putf(&out_loop, "%s    if (%s) { %s = 1; break; }\n", ind, bc, res);
+        else if (strcmp(prop, "every") == 0)
+            b_putf(&out_loop, "%s    if (!(%s)) { %s = 0; break; }\n", ind, bc, res);
+        else
+            b_putf(&out_loop, "%s    if (%s) { %s = %s; break; }\n", ind, bc, res, pname);
+        b_putf(&out_loop, "%s}\n", ind);
+        free(bodyc.s);
+        result_name = cmc_arena_strndup(em->ctx->arena, res, strlen(res));
+        if (strcmp(prop, "some") == 0 || strcmp(prop, "every") == 0) result_is_bool = 1;
     } else {
         char outv[32]; snprintf(outv, sizeof outv, "__out%d", em->tmp);
         char acc[32];  snprintf(acc,  sizeof acc,  "__acc%d", em->tmp);
@@ -947,6 +985,7 @@ static EStr emit_arr_higher(Emit *em, CmcNode *n, const char *prop, EStr o) {
     if (result_name) {
         if (strcmp(prop, "map") == 0 || strcmp(prop, "filter") == 0)
             return estr(result_name, CT_ARR, 0, 1, NULL);
+        if (result_is_bool) return estr(result_name, CT_BOOL, 0, 0, NULL);
         return estr(result_name, CT_DOUBLE, 0, 0, NULL);
     }
     return estr("0", CT_INT, 0, 0, NULL);
@@ -1127,8 +1166,26 @@ static EStr emit_call(Emit *em, CmcNode *n) {
                 t = CT_STR;
             } else if (strcmp(prop, "length") == 0) {
                 b_putf(&b, "(int)(%s%slen)", o.code, o.ptr ? "->" : ".");
+            } else if (strcmp(prop, "indexOf") == 0) {
+                Buf v; b_init(&v); co_num(em, &v, args[0]);
+                b_putf(&b, "mochi_array_index_of(%s, %s)", o.code, v.s);
+                free(v.s);
+            } else if (strcmp(prop, "includes") == 0) {
+                Buf v; b_init(&v); co_num(em, &v, args[0]);
+                b_putf(&b, "mochi_array_includes(%s, %s)", o.code, v.s);
+                free(v.s);
+                t = CT_BOOL;
+            } else if (strcmp(prop, "slice") == 0) {
+                b_putf(&b, "mochi_array_slice(%s, %s, %s)", o.code,
+                        args[0].code, (n->nargs > 1 ? args[1].code : "(int)(%s->len)"));
+                t = CT_ARR;
+            } else if (strcmp(prop, "reverse") == 0) {
+                b_putf(&b, "mochi_array_reverse(%s)", o.code);
+                t = CT_ARR;
             } else if (strcmp(prop, "map") == 0 || strcmp(prop, "filter") == 0 ||
-                       strcmp(prop, "reduce") == 0 || strcmp(prop, "forEach") == 0) {
+                       strcmp(prop, "reduce") == 0 || strcmp(prop, "forEach") == 0 ||
+                       strcmp(prop, "some") == 0 || strcmp(prop, "every") == 0 ||
+                       strcmp(prop, "find") == 0) {
                 EStr r = emit_arr_higher(em, n, prop, o);
                 free(args);
                 return r;
@@ -1158,7 +1215,19 @@ static EStr emit_call(Emit *em, CmcNode *n) {
             else if (strcmp(prop, "repeat") == 0) b_putf(&b, "mochi_repeat(%s, %s)", o.code, args[0].code);
             else if (strcmp(prop, "replace") == 0) b_putf(&b, "mochi_replace(%s, %s, %s)", o.code, args[0].code, args[1].code);
             else if (strcmp(prop, "split") == 0) { b_putf(&b, "mochi_split(%s, %s)", o.code, args[0].code); t = CT_ARR; }
-            else b_putf(&b, "%s", o.code);
+            else if (strcmp(prop, "padStart") == 0) {
+            Buf ln, fl; b_init(&ln); b_init(&fl);
+            co_num(em, &ln, args[0]);
+            co_str(em, &fl, n->nargs > 1 ? args[1] : estr("0", CT_STR, 0, 1, NULL));
+            b_putf(&b, "mochi_pad_start(%s, (int)%s, %s)", o.code, ln.s, fl.s);
+            free(ln.s); free(fl.s);
+            } else if (strcmp(prop, "padEnd") == 0) {
+            Buf ln, fl; b_init(&ln); b_init(&fl);
+            co_num(em, &ln, args[0]);
+            co_str(em, &fl, n->nargs > 1 ? args[1] : estr("0", CT_STR, 0, 1, NULL));
+            b_putf(&b, "mochi_pad_end(%s, (int)%s, %s)", o.code, ln.s, fl.s);
+            free(ln.s); free(fl.s);
+            } else b_putf(&b, "%s", o.code);
             free(args);
             return estr(b.s, t, 0, (t == CT_STR || t == CT_ARR) ? 1 : 0, NULL);
         }
