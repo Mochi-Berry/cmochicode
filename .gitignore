@@ -1,0 +1,13 @@
+# Build artifacts
+build/
+cmochi.exe
+dbg.exe
+warn.txt
+*.o
+
+# Node
+node_modules/
+
+# Editor
+.vscode/
+.idea/

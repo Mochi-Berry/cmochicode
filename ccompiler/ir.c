@@ -1,0 +1,375 @@
+/*
+ * ir.c — stage 3 of the cmochicode pipeline: typed Micro-IR.
+ *  3a: type inference over the AST (with a scoped symbol table)
+ *  3b: escape analysis (which heap values leave their function)
+ *
+ * The IR is a lightweight annotation layer: cmc_type_of() and the escape
+ * query feed the C99 emitter. Feature lowering (arrow functions, ?., ??,
+ * destructuring, template folding) happens here and in the emitter so the
+ * output is pure C99.
+ */
+#include "cmochi.h"
+
+/* ------------------------- symbol table ------------------------- */
+void cmc_env_init(CmcEnv *env, CmcArena *arena) {
+    env->stack = NULL;
+    cmc_env_push(env, arena);
+}
+
+void cmc_env_push(CmcEnv *env, CmcArena *arena) {
+    CmcScopeNode *s = (CmcScopeNode *)cmc_arena_alloc(arena, sizeof(CmcScopeNode));
+    s->scope.syms = NULL; s->scope.n = 0; s->scope.cap = 0;
+    s->up = env->stack;
+    env->stack = s;
+}
+
+void cmc_env_pop(CmcEnv *env) {
+    if (env->stack && env->stack->up) env->stack = env->stack->up;
+}
+
+CmcSym *cmc_env_decl(CmcEnv *env, const char *name, CmcType type, CmcSymKind kind) {
+    CmcScope *s = &env->stack->scope;
+    if (s->n == s->cap) {
+        s->cap = s->cap ? s->cap * 2 : 8;
+        CmcSym *ns = (CmcSym *)realloc(s->syms, sizeof(CmcSym) * s->cap);
+        s->syms = ns;
+    }
+    CmcSym *sym = &s->syms[s->n++];
+    memset(sym, 0, sizeof(*sym));
+    sym->name = name;
+    sym->cname = name;
+    sym->type = type;
+    sym->kind = kind;
+    return sym;
+}
+
+CmcSym *cmc_env_lookup(CmcEnv *env, const char *name) {
+    for (CmcScopeNode *s = env->stack; s; s = s->up) {
+        for (int i = 0; i < s->scope.n; i++) {
+            if (strcmp(s->scope.syms[i].name, name) == 0) return &s->scope.syms[i];
+        }
+    }
+    return NULL;
+}
+
+const char *cmc_cname(CmcEnv *env, const char *name) {
+    CmcSym *s = cmc_env_lookup(env, name);
+    return s ? s->cname : name;
+}
+
+/* ------------------------- type helpers ------------------------- */
+int cmc_is_numeric(CmcType t) {
+    return t == CT_INT || t == CT_INT64 || t == CT_DOUBLE;
+}
+
+const char *cmc_type_name(CmcType t) {
+    switch (t) {
+        case CT_INT:    return "int";
+        case CT_INT64:  return "int64_t";
+        case CT_DOUBLE: return "double";
+        case CT_STR:    return "const char *";
+        case CT_BOOL:   return "int";
+        case CT_OBJ:    return "void *";
+        case CT_ARR:    return "mochi_array *";
+        case CT_NULL:   return "void *";
+        case CT_UNDEF:  return "void *";
+        case CT_VOID:   return "void";
+        case CT_UNKNOWN:return "double";
+        case CT_MOCHI_VAL: return "mochi_val";
+    }
+    return "double";
+}
+
+static CmcType promote(CmcType a, CmcType b) {
+    if (a == CT_STR || b == CT_STR) return CT_STR;
+    if (a == CT_MOCHI_VAL || b == CT_MOCHI_VAL) return CT_MOCHI_VAL;
+    if (a == CT_DOUBLE || b == CT_DOUBLE) return CT_DOUBLE;
+    if (a == CT_INT64 || b == CT_INT64) return CT_INT64;
+    if (cmc_is_numeric(a) && cmc_is_numeric(b)) return CT_INT;
+    if (a == CT_NULL) return b;
+    if (b == CT_NULL) return a;
+    if (a == CT_OBJ || b == CT_OBJ) return CT_OBJ;
+    if (a == CT_ARR || b == CT_ARR) return CT_ARR;
+    return CT_UNKNOWN;
+}
+
+/* Struct shape registry: object literals -> struct name + field types. */
+typedef struct {
+    const char *sig;
+    const char *name;
+    CmcNode    *literal;
+    const char *field_names[32];
+    CmcType     field_types[32];
+    int         nfields;
+} CmcShape;
+
+typedef struct {
+    CmcShape *shapes;
+    int       n, cap;
+} CmcShapes;
+
+static CmcShapes g_shapes;
+
+static const char *shape_sig(CmcArena *arena, CmcNode *obj) {
+    /* build a signature string like "x:int,y:str" */
+    char buf[512]; size_t p = 0;
+    for (int i = 0; i < obj->nprops; i++) {
+        CmcProp *pr = &obj->props[i];
+        CmcType t = CT_UNKNOWN;
+        if (pr->value) {
+            CmcNode *v = pr->value;
+            if (v->kind == N_NUM) t = (v->num == (long long)v->num) ? CT_INT : CT_DOUBLE;
+            else if (v->kind == N_BIGINT) t = CT_INT64;
+            else if (v->kind == N_STR) t = CT_STR;
+            else if (v->kind == N_BOOL) t = CT_BOOL;
+            else if (v->kind == N_NULL) t = CT_NULL;
+            else if (v->kind == N_ARR) t = CT_ARR;
+            else if (v->kind == N_OBJ) t = CT_OBJ;
+        }
+        int n = snprintf(buf + p, sizeof(buf) - p, "%s:%d,", pr->key, (int)t);
+        p += n;
+    }
+    return cmc_arena_strndup(arena, buf, p);
+}
+
+/* Register an object literal; return its struct name. */
+const char *cmc_register_shape(CmcArena *arena, CmcNode *obj) {
+    const char *sig = shape_sig(arena, obj);
+    for (int i = 0; i < g_shapes.n; i++) {
+        if (strcmp(g_shapes.shapes[i].sig, sig) == 0) return g_shapes.shapes[i].name;
+    }
+    if (g_shapes.n == g_shapes.cap) {
+        g_shapes.cap = g_shapes.cap ? g_shapes.cap * 2 : 16;
+        CmcShape *ns = (CmcShape *)realloc(g_shapes.shapes, sizeof(CmcShape) * g_shapes.cap);
+        g_shapes.shapes = ns;
+    }
+    CmcShape *sh = &g_shapes.shapes[g_shapes.n++];
+    memset(sh, 0, sizeof(*sh));
+    sh->sig = sig;
+    char nm[32]; snprintf(nm, sizeof nm, "CmcStruct_%d", g_shapes.n);
+    sh->name = cmc_arena_strndup(arena, nm, strlen(nm));
+    sh->literal = obj;
+    sh->nfields = obj->nprops;
+    for (int i = 0; i < obj->nprops && i < 32; i++) {
+        sh->field_names[i] = obj->props[i].key;
+        CmcNode *v = obj->props[i].value;
+        CmcType t = CT_UNKNOWN;
+        if (v) {
+            if (v->kind == N_NUM) t = (v->num == (long long)v->num) ? CT_INT : CT_DOUBLE;
+            else if (v->kind == N_BIGINT) t = CT_INT64;
+            else if (v->kind == N_STR) t = CT_STR;
+            else if (v->kind == N_BOOL) t = CT_BOOL;
+            else if (v->kind == N_NULL) t = CT_NULL;
+            else if (v->kind == N_ARR) t = CT_ARR;
+            else if (v->kind == N_OBJ) t = CT_OBJ;
+            else t = CT_UNKNOWN;
+        }
+        sh->field_types[i] = t;
+    }
+    return sh->name;
+}
+
+const char *cmc_shape_name_for(const char *sig_or_name);
+const char *cmc_struct_field_type(const char *struct_name, const char *field) {
+    for (int i = 0; i < g_shapes.n; i++) {
+        if (strcmp(g_shapes.shapes[i].name, struct_name) == 0) {
+            for (int j = 0; j < g_shapes.shapes[i].nfields; j++) {
+                if (strcmp(g_shapes.shapes[i].field_names[j], field) == 0)
+                    return cmc_type_name(g_shapes.shapes[i].field_types[j]);
+            }
+        }
+    }
+    return NULL; /* field not in shape: caller decides (dynamic add / default) */
+}
+
+/* Semantic (CmcType) of a named field — lets the emitter tell `bool` (CT_BOOL,
+   C type "int") from a real integer, since both map to "int" in C. */
+CmcType cmc_struct_field_kind(const char *struct_name, const char *field) {
+    for (int i = 0; i < g_shapes.n; i++) {
+        if (strcmp(g_shapes.shapes[i].name, struct_name) == 0) {
+            for (int j = 0; j < g_shapes.shapes[i].nfields; j++) {
+                if (strcmp(g_shapes.shapes[i].field_names[j], field) == 0)
+                    return g_shapes.shapes[i].field_types[j];
+            }
+        }
+    }
+    return CT_UNKNOWN;
+}
+
+/* Field access by index — used by the emitter to print object literals. */
+const char *cmc_struct_field_name_n(const char *struct_name, int idx) {
+    for (int i = 0; i < g_shapes.n; i++) {
+        if (strcmp(g_shapes.shapes[i].name, struct_name) == 0) {
+            if (idx < 0 || idx >= g_shapes.shapes[i].nfields) return NULL;
+            return g_shapes.shapes[i].field_names[idx];
+        }
+    }
+    return NULL;
+}
+const char *cmc_struct_field_type_n(const char *struct_name, int idx) {
+    for (int i = 0; i < g_shapes.n; i++) {
+        if (strcmp(g_shapes.shapes[i].name, struct_name) == 0) {
+            if (idx < 0 || idx >= g_shapes.shapes[i].nfields) return NULL;
+            return cmc_type_name(g_shapes.shapes[i].field_types[idx]);
+        }
+    }
+    return NULL;
+}
+
+/* Registered-shape iteration (used by the emitter to emit struct defs). */
+int cmc_shape_count(void) { return g_shapes.n; }
+const char *cmc_shape_name(int i) { return (i >= 0 && i < g_shapes.n) ? g_shapes.shapes[i].name : NULL; }
+int cmc_shape_field_count(int i) { return (i >= 0 && i < g_shapes.n) ? g_shapes.shapes[i].nfields : 0; }
+const char *cmc_shape_field_name(int i, int j) {
+    if (i < 0 || i >= g_shapes.n || j < 0 || j >= g_shapes.shapes[i].nfields) return NULL;
+    return g_shapes.shapes[i].field_names[j];
+}
+const char *cmc_shape_field_type(int i, int j) {
+    if (i < 0 || i >= g_shapes.n || j < 0 || j >= g_shapes.shapes[i].nfields) return NULL;
+    return cmc_type_name(g_shapes.shapes[i].field_types[j]);
+}
+
+/* Merge a dynamically-assigned field into a registered shape (JS allows
+ * point.label = "P" on an object literal that only had {x, y}). */
+void cmc_shape_add_field(const char *struct_name, const char *field, CmcType t) {
+    for (int i = 0; i < g_shapes.n; i++) {
+        if (strcmp(g_shapes.shapes[i].name, struct_name) != 0) continue;
+        for (int j = 0; j < g_shapes.shapes[i].nfields; j++)
+            if (strcmp(g_shapes.shapes[i].field_names[j], field) == 0) return; /* already there */
+        if (g_shapes.shapes[i].nfields < 32) {
+            int n = g_shapes.shapes[i].nfields++;
+            g_shapes.shapes[i].field_names[n] = field;
+            g_shapes.shapes[i].field_types[n] = t;
+        }
+        return;
+    }
+}
+
+/* ------------------------- type inference ------------------------- */
+CmcType cmc_type_of(CmcCtx *ctx, CmcEnv *env, CmcNode *n) {
+    if (!n) return CT_UNKNOWN;
+    switch (n->kind) {
+        case N_NUM:    return (n->num == (long long)n->num) ? CT_INT : CT_DOUBLE;
+        case N_BIGINT: return CT_INT64;
+        case N_STR:    return CT_STR;
+        case N_BOOL:   return CT_BOOL;
+        case N_NULL:   return CT_NULL;
+        case N_UNDEF:  return CT_UNDEF;
+        case N_THIS:   return CT_UNKNOWN;
+        case N_IDENT: {
+            CmcSym *s = cmc_env_lookup(env, n->name);
+            return s ? s->type : CT_UNKNOWN;
+        }
+        case N_MEMBER: {
+            CmcType ot = cmc_type_of(ctx, env, n->obj);
+            if (n->computed) return ot == CT_ARR ? CT_MOCHI_VAL : (ot == CT_STR ? CT_STR : CT_UNKNOWN);
+            const char *prop = n->prop ? n->prop->name : "";
+            if (ot == CT_ARR && strcmp(prop, "length") == 0) return CT_INT;
+            if (ot == CT_STR && strcmp(prop, "length") == 0) return CT_INT;
+            if (ot == CT_STR) return CT_STR;
+            if (ot == CT_OBJ) {
+                /* look up symbol for struct */
+                if (n->obj->kind == N_IDENT) {
+                    CmcSym *s = cmc_env_lookup(env, n->obj->name);
+                    if (s && s->struct_name) {
+                        for (int i = 0; i < g_shapes.n; i++) {
+                            if (strcmp(g_shapes.shapes[i].name, s->struct_name) == 0) {
+                                for (int j = 0; j < g_shapes.shapes[i].nfields; j++) {
+                                    if (strcmp(g_shapes.shapes[i].field_names[j], prop) == 0)
+                                        return g_shapes.shapes[i].field_types[j];
+                                }
+                            }
+                        }
+                    }
+                }
+                return CT_UNKNOWN;
+            }
+            return CT_UNKNOWN;
+        }
+        case N_CALL: {
+            CmcNode *callee = n->obj;
+            if (callee->kind == N_IDENT) {
+                const char *nm = callee->name;
+                if (strcmp(nm, "parseInt") == 0 || strcmp(nm, "parseFloat") == 0 ||
+                    strcmp(nm, "Number") == 0 || strcmp(nm, "isNaN") == 0 ||
+                    strcmp(nm, "isFinite") == 0) return CT_DOUBLE;
+                if (strcmp(nm, "String") == 0) return CT_STR;
+                if (strcmp(nm, "Boolean") == 0) return CT_BOOL;
+                CmcSym *s = cmc_env_lookup(env, nm);
+                if (s && s->kind == SYM_FUNC) return s->type;
+                return CT_UNKNOWN;
+            }
+            if (callee->kind == N_MEMBER) {
+                CmcType ot = cmc_type_of(ctx, env, callee->obj);
+                const char *prop = callee->prop ? callee->prop->name : "";
+                if (ot == CT_ARR) {
+                    if (strcmp(prop, "push") == 0 || strcmp(prop, "pop") == 0 ||
+                        strcmp(prop, "length") == 0) return CT_INT;
+                    if (strcmp(prop, "join") == 0) return CT_STR;
+                }
+                if (ot == CT_STR) {
+                    if (strcmp(prop, "indexOf") == 0 || strcmp(prop, "includes") == 0 ||
+                        strcmp(prop, "startsWith") == 0) return CT_INT;
+                    return CT_STR;
+                }
+            }
+            return CT_UNKNOWN;
+        }
+        case N_BIN: {
+            if (n->op == TK_PLUS) {
+                CmcType l = cmc_type_of(ctx, env, n->lhs);
+                CmcType r = cmc_type_of(ctx, env, n->rhs);
+                if (l == CT_STR || r == CT_STR) return CT_STR;
+                return promote(l, r);
+            }
+            if (n->op == TK_SLASH) return CT_DOUBLE;
+            if (n->op == TK_PERCENT) return CT_INT;
+            if (n->op == TK_EQEQ || n->op == TK_EQEQEQ || n->op == TK_NE || n->op == TK_NEEQ ||
+                n->op == TK_LT || n->op == TK_LE || n->op == TK_GT || n->op == TK_GE) return CT_BOOL;
+            if (n->op == TK_ANDAND || n->op == TK_OROR || n->op == TK_NULLISH)
+                return promote(cmc_type_of(ctx, env, n->lhs), cmc_type_of(ctx, env, n->rhs));
+            return CT_INT;
+        }
+        case N_UNARY:
+            if (n->op == TK_TYPEOF) return CT_STR;
+            if (n->op == TK_NOT || n->op == TK_TILDE) return CT_INT;
+            return cmc_type_of(ctx, env, n->lhs);
+        case N_ASSIGN:
+            return n->rhs ? cmc_type_of(ctx, env, n->rhs) : cmc_type_of(ctx, env, n->lhs);
+        case N_UPDATE:
+            return cmc_type_of(ctx, env, n->lhs);
+        case N_COND:
+            return promote(cmc_type_of(ctx, env, n->rhs), cmc_type_of(ctx, env, n->third));
+        case N_ARR:  return CT_ARR;
+        case N_OBJ:  return CT_OBJ;
+        case N_TEMPLATE: return CT_STR;
+        case N_SEQ:  return n->nstmts ? cmc_type_of(ctx, env, n->stmts[n->nstmts - 1]) : CT_UNDEF;
+        case N_NULLISH:
+            return promote(cmc_type_of(ctx, env, n->lhs), cmc_type_of(ctx, env, n->rhs));
+        default: return CT_UNKNOWN;
+    }
+}
+
+/* ------------------------- escape analysis ------------------------- */
+static int uses_as_arg(CmcNode *node, const char *name) {
+    if (!node) return 0;
+    if (node->kind == N_IDENT && strcmp(node->name, name) == 0) return 1;
+    if (node->kind == N_CALL) {
+        for (int i = 0; i < node->nargs; i++) {
+            if (uses_as_arg(node->args[i], name)) return 1;
+        }
+        return uses_as_arg(node->obj, name);
+    }
+    if (node->kind == N_MEMBER) {
+        return uses_as_arg(node->obj, name) || uses_as_arg(node->prop, name);
+    }
+    if (node->kind == N_BIN) return uses_as_arg(node->lhs, name) || uses_as_arg(node->rhs, name);
+    if (node->kind == N_ASSIGN) return uses_as_arg(node->lhs, name) || uses_as_arg(node->rhs, name);
+    if (node->kind == N_RETURN) return uses_as_arg(node->lhs, name);
+    return 0;
+}
+
+int cmc_var_escapes(CmcNode *fn, const char *name) {
+    /* conservative: escapes if the value is returned or passed as an arg */
+    return uses_as_arg(fn, name);
+}

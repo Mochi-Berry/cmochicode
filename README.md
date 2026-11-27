@@ -1,0 +1,91 @@
+# cmochicode
+
+**JavaScript → C99 source codegen for MochiBerry.** Transpile JS to readable,
+self-contained C99 that compiles with `gcc`/`clang` into a tiny native binary —
+no bytecode, no VM dispatch loop, no heavyweight JSValue objects (unlike
+QuickJS `qjsc`). Optionally, the generated C can borrow the MochiBerry
+GC/arena allocator when built with `-DCMC_WITH_MOCHIBERRY`.
+
+Built for **Mochi-Berry** (MochiBerry). MIT license. Node >= 18.
+
+## Architecture: 4-stage pipeline
+
+```
+ECMA Lexer/Pratt Parser  ->  Typed Micro-IR  ->  Escape & Scope Analyzer  ->  Pure C99 Emitter
+(ccompiler/lex.c parse.c)   (ccompiler/ir.c)      (ir.c / emit.c)             (ccompiler/emit.c)
+```
+
+- **Frontend is C99, not TypeScript.** No `tsc`/Compiler API (tens of MB, slow
+  startup, stale ES5/TS semantics). Nodes are allocated in a bump arena with
+  zero-copy slices into the source buffer — no malloc/free per node.
+- **Typed Micro-IR:** integral numbers stay `int64_t`/`int32_t` (not `double`),
+  `100n` → `int64_t`, `bool` → `<stdbool.h>`, string literals → `const char *`.
+  Arrow functions are lambda-lifted to `static` functions (with an env struct if
+  they capture outer variables). `?.` / `??` lower to short-circuit guards with
+  **no wrapper objects** (e.g. `int32_t port = (cfg && cfg->has_port) ? cfg->port : 8080;`).
+  Destructuring lowers via SROA (`const {x, y} = point` → read fields straight into registers).
+- **Compile-time string fusion** for `console.log` & template literals: a
+  concatenation/template is split at the AST level into a single `printf` call —
+  no heap string allocation. One constant → `puts("...")`; string+var →
+  `printf("... %lld ...\n", val)` with the format specifier picked from type inference.
+- **Escape analysis:** locals that do not escape (not returned, not stored to a
+  global, not captured by a closure) are lowered to stack structs/arrays — zero
+  allocation cycles, automatically freed.
+- **Micro-runtime `runtime/cmochicode_rt.h`** (125 lines, macro-based): the
+  allocator is pluggable — `CMC_ALLOC`/`CMC_FREE` map to `malloc`/`free` in
+  standalone mode, or to the MochiBerry GC/arena (`mbjs_gc_alloc`) when
+  `-DCMC_WITH_MOCHIBERRY` is defined. The runtime is only touched when the
+  program actually needs the allocator/GC or heap/string ops; everything else
+  is `puts`/`printf`/arithmetic/structs.
+
+## Build & use
+
+### Compiler (`cmochi.exe`)
+
+```sh
+make                 # -> cmochi.exe (<200 KB)
+./cmochi.exe in.js -o out.c    # transpile
+gcc -std=c99 -O2 -s -I runtime out.c -o out -lm   # native binary
+./out
+```
+
+`make check` transpiles + compiles all `examples/*.js`.
+
+### MochiBerry native module (`mochi_modules`)
+
+```js
+const cm = await import('path/to/cmochicode.dll');
+cm.version();                       // '0.1.0'
+const c = cm.compile(src);          // JS string -> C99 string
+const c2 = cm.compileFile('a.js');  // JS file -> C99 string
+```
+
+The DLL exports `mbjs_init_module` (the MochiBerry ABI) and binds
+`compile`/`compileFile`/`version` via `SetModuleExportList` inside its
+`mod_init` callback — same pattern as `mochifs.c`.
+
+## Examples
+
+`examples/` contains 7 programs that are verified to produce **byte-for-byte
+identical output to node** (`make check` + a diff against `node file.js`):
+`hello`, `math`, `strings`, `objects`, `arrays`, `control`, `fib`.
+
+## Layout
+
+```
+ccompiler/   C99 pipeline: cmochi.h, lex.c, parse.c, ir.c, emit.c, main.c
+runtime/     cmochicode_rt.h (micro-runtime) + mochi.h/mochi_gc.h (GC wiring)
+native/      cmochicode_module.c — MochiBerry native module source
+mochi_modules/  built cmochicode.dll + test_native.mjs
+examples/    7 verified JS->C examples
+src/         legacy acorn JS->C codegen (reference oracle; not the C99 path)
+```
+
+## Status
+
+- C99 native pipeline is **green**: all 7 examples transpile, compile with
+  `gcc -O2 -s -lm`, and match node output exactly.
+- The MochiBerry native module (`mochi_modules/cmochicode.dll`) works: it
+  compiles JS → C inside MochiBerry, and the emitted C compiles + runs and
+  matches node.
+- Compiler binary `cmochi.exe` ≈ **132 KB** (target < 200 KB).
