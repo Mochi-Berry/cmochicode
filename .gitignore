@@ -4,9 +4,13 @@ cmochi.exe
 dbg.exe
 warn.txt
 *.o
+*.obj
+*.tmp
+Thumbs.db
 
-# Node
-node_modules/
+# NOTE: node_modules/ is NOT ignored — in this org it is the committed JS face
+# layer (TGPM layout). npm-installed packages inside it are ignored by
+# node_modules/.gitignore.
 
 # Editor
 .vscode/

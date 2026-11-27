@@ -113,7 +113,7 @@ typedef enum {
     N_VAR, N_FUNC, N_IF, N_WHILE, N_DOWHILE, N_FOR, N_FOROF, N_RETURN,
     N_BREAK, N_CONTINUE, N_BLOCK, N_SWITCH, N_EXPRSTMT, N_THROW, N_TRY,
     N_FORIN,
-    N_DESTRUCT_OBJ, N_DESTRUCT_ARR, N_THIS,
+    N_DESTRUCT_OBJ, N_DESTRUCT_ARR, N_THIS, N_CLASS,
 } CmcNodeKind;
 
 typedef struct CmcNode CmcNode;
@@ -154,6 +154,7 @@ struct CmcNode {
     CmcNode    *body;        /* expression or block */
     int         is_async, is_expr_body;
     int         is_rest;       /* rest param (...args) -> collects remaining args */
+    int         is_new;        /* `new Ctor(...)` call */
     /* function declaration */
     const char *fname;
     /* statements */

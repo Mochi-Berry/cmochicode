@@ -1,21 +1,34 @@
 # Makefile — build the cmochi native JS->C compiler (C99 pipeline).
 #
 #   make            -> cmochi.exe (the compiler)
-#   make app SRC=examples/hello.js
+#   make app APPSRC=examples/hello.js
 #   make check      -> transpile + compile + run all examples
 #
 CC      = gcc
 CFLAGS  = -std=c99 -Wall -Wextra -O2 -I ccompiler -I runtime
-SRC     = ccompiler/main.c ccompiler/lex.c ccompiler/parse.c ccompiler/ir.c ccompiler/emit.c
+CSRC    = ccompiler/main.c ccompiler/lex.c ccompiler/parse.c ccompiler/ir.c ccompiler/emit.c
 
-cmochi: $(SRC) ccompiler/cmochi.h runtime/cmochicode_rt.h
-	$(CC) $(CFLAGS) -o cmochi.exe $(SRC)
+cmochi: $(CSRC) ccompiler/cmochi.h runtime/cmochicode_rt.h
+	$(CC) $(CFLAGS) -o cmochi.exe $(CSRC)
+
+# MochiBerry native module (TGPM layout):
+#   mochi_modules/src/cmochicode.c -> mochi_modules/lib/cmochicode_x86_64.dll
+MODULE = mochi_modules/lib/cmochicode_x86_64.dll
+ENGINE_INC ?= E:/bcf/mochiberry
+
+module: $(MODULE)
+
+$(MODULE): mochi_modules/src/cmochicode.c $(CSRC) mochi_modules/include/cmochicode.h
+	@mkdir -p mochi_modules/lib
+	$(CC) -shared -O2 -o $@ mochi_modules/src/cmochicode.c \
+	    ccompiler/lex.c ccompiler/parse.c ccompiler/ir.c ccompiler/emit.c \
+	    -Iccompiler -Iruntime -Imochi_modules/include -I$(ENGINE_INC) -IE:/sevm/native
 
 # Transpile one example and compile the result to a native binary.
 app: cmochi
-	@if [ -z "$(SRC)" ]; then echo "usage: make app SRC=examples/hello.js"; exit 1; fi
-	./cmochi.exe $(SRC) -o build/$(basename $(notdir $(SRC))).c
-	$(CC) -std=c99 -O2 -s -I runtime build/$(basename $(notdir $(SRC))).c -o build/$(basename $(notdir $(SRC))).exe -lm
+	@if [ -z "$(APPSRC)" ]; then echo "usage: make app APPSRC=examples/hello.js"; exit 1; fi
+	./cmochi.exe $(APPSRC) -o build/$(basename $(notdir $(APPSRC))).c
+	$(CC) -std=c99 -O2 -s -I runtime build/$(basename $(notdir $(APPSRC))).c -o build/$(basename $(notdir $(APPSRC))).exe -lm
 
 check: cmochi
 	@mkdir -p build
@@ -30,4 +43,4 @@ check: cmochi
 clean:
 	rm -f cmochi.exe build/*.c build/*.exe
 
-.PHONY: app check clean
+.PHONY: module app check clean

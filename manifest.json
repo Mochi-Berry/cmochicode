@@ -1,0 +1,25 @@
+{
+  "name": "cmochicode",
+  "version": "0.1.0",
+  "layer": "package",
+  "description": "JS -> C99 transpiler for MochiBerry: lex/parse/IR/emit pipeline, native module + standalone compiler",
+  "status": "operational",
+  "entry": "./node_modules/src/index.js",
+  "layers": {
+    "js": "./node_modules/manifest.json",
+    "native": "./mochi_modules/manifest.json"
+  },
+  "abi_version": "MBC1",
+  "native_entry": "mbjs_init_module",
+  "runtime_exports": [
+    "compile",
+    "compileFile",
+    "version"
+  ],
+  "build": {
+    "engine_include": "$ENGINE_INC",
+    "lib_dir": "./mochi_modules/lib",
+    "output": "./mochi_modules/lib/cmochicode_x86_64.dll",
+    "link_libs": []
+  }
+}

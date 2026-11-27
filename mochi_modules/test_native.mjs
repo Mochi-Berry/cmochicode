@@ -1,5 +1,5 @@
 // test_native.mjs — full loop: JS -> C (native module) -> gcc -> binary -> run
-const cm = await import('E:/cmochicode/mochi_modules/cmochicode.dll');
+const cm = await import('E:/cmochicode/mochi_modules/lib/cmochicode_x86_64.dll');
 console.log('cmochicode version:', cm.version());
 
 const src = `

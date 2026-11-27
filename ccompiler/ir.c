@@ -168,6 +168,12 @@ const char *cmc_register_shape(CmcArena *arena, CmcNode *obj) {
             else if (v->kind == N_NULL) t = CT_NULL;
             else if (v->kind == N_ARR) t = CT_ARR;
             else if (v->kind == N_OBJ) t = CT_OBJ;
+            else if (v->kind == N_BIN) {
+                /* string concatenation / template-ish expression */
+                int ls = v->lhs && (v->lhs->kind == N_STR || v->lhs->kind == N_TEMPLATE);
+                int rs = v->rhs && (v->rhs->kind == N_STR || v->rhs->kind == N_TEMPLATE);
+                t = (ls || rs) ? CT_STR : CT_UNKNOWN;
+            }
             else t = CT_UNKNOWN;
         }
         sh->field_types[fi] = t;

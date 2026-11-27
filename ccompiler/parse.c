@@ -306,6 +306,7 @@ static CmcNode *parse_primary(Parser *p) {
         case TK_NEW: {
             next(p);
             CmcNode *n = new_node(p, N_CALL);
+            n->is_new = 1;
             n->obj = parse_primary(p);
             if (accept(p, TK_LPAREN)) {
                 int cap = 4, cnt = 0;
@@ -669,6 +670,46 @@ static CmcNode *parse_stmt(Parser *p) {
             expect(p, TK_RPAREN);
             n->params = params; n->nparams = cnt;
             n->body = parse_block(p);
+            return n;
+        }
+        case TK_CLASS: {
+            /* class Name [extends Base] { ctor/methods } -> N_CLASS with CmcProp[] */
+            next(p);
+            CmcNode *n = new_node(p, N_CLASS);
+            n->fname = ident_name(p);
+            if (accept(p, TK_EXTENDS)) n->obj = parse_primary(p); /* base class name */
+            CmcProp *props = (CmcProp *)cmc_arena_alloc(p->arena, sizeof(CmcProp) * 4);
+            int cap = 4, cnt = 0;
+            expect(p, TK_LBRACE);
+            while (!check(p, TK_RBRACE) && !check(p, TK_EOF)) {
+                if (check(p, TK_SEMI) || check(p, TK_DOTDOTDOT)) { next(p); continue; }
+                const char *mname = ident_name(p);
+                CmcNode *fn = new_node(p, N_ARROW);
+                fn->is_expr_body = 0;
+                fn->fname = mname;
+                expect(p, TK_LPAREN);
+                int pcap = 4, pcnt = 0;
+                CmcNode **params = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * pcap);
+                while (!check(p, TK_RPAREN)) {
+                    CmcNode *par = parse_binding_target(p);
+                    if (accept(p, TK_EQ)) { CmcNode *d = new_node(p, N_ASSIGN); d->lhs = par; d->rhs = parse_expr(p, 2); par = d; }
+                    if (pcnt == pcap) { pcap *= 2; CmcNode **np = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * pcap); memcpy(np, params, pcnt * sizeof(CmcNode *)); params = np; }
+                    params[pcnt++] = par;
+                    if (!accept(p, TK_COMMA)) break;
+                }
+                expect(p, TK_RPAREN);
+                fn->params = params; fn->nparams = pcnt;
+                fn->body = parse_block(p);
+                if (cnt == cap) { cap *= 2; CmcProp *np = (CmcProp *)cmc_arena_alloc(p->arena, sizeof(CmcProp) * cap); memcpy(np, props, cnt * sizeof(CmcProp)); props = np; }
+                props[cnt].key = mname;
+                props[cnt].value = fn;
+                props[cnt].spread = 0;
+                props[cnt].computed = 0;
+                cnt++;
+                if (!accept(p, TK_SEMI)) ;
+            }
+            expect(p, TK_RBRACE);
+            n->props = props; n->nprops = cnt;
             return n;
         }
         case TK_IF: {
