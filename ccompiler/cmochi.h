@@ -155,6 +155,7 @@ struct CmcNode {
     int         is_async, is_expr_body;
     int         is_rest;       /* rest param (...args) -> collects remaining args */
     int         is_new;        /* `new Ctor(...)` call */
+    int         is_spread;     /* call arg = `...expr` (spread of an array value) */
     /* function declaration */
     const char *fname;
     /* statements */

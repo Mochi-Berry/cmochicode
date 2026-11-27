@@ -407,8 +407,10 @@ static CmcNode *parse_postfix(Parser *p, CmcNode *base) {
                             args[cnt++] = sp->elems[j];
                         }
                     } else {
-                        /* unknown spread source: keep as a single arg marker */
+                        /* runtime spread source: keep as a single arg marker;
+                           the emitter expands it into the arg list (arity-aware) */
                         if (cnt == cap) { cap *= 2; CmcNode **np = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * cap); memcpy(np, args, cnt * sizeof(CmcNode *)); args = np; }
+                        sp->is_spread = 1;
                         args[cnt++] = sp;
                     }
                 } else {

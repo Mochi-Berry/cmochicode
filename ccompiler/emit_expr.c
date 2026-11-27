@@ -777,6 +777,55 @@ const char *build_rest_array(Emit *em, EStr *args, int ri, int nargs) {
     return name;
 }
 
+/* ---- call spread: dynamic-arity argument materialization ----
+ * A call with a `...expr` arg has a runtime-dependent arity, which cannot be
+ * expressed as a fixed C argument list. We materialize the entire argument
+ * sequence into a fresh mochi_array* (spread args expanded element-by-element),
+ * then read each callee parameter position out of it with a bounds guard.
+ * This is the dynamic-typing path: static calls (no spread) keep the fast
+ * fixed-arity lowering above. */
+int has_call_spread(CmcNode *n) {
+    for (int i = 0; i < n->nargs; i++)
+        if (n->args[i] && n->args[i]->is_spread) return 1;
+    return 0;
+}
+const char *build_call_arg_array(Emit *em, CmcNode *n, EStr *args) {
+    const char *name = tmp_name(em, "cargs");
+    Buf l; b_init(&l);
+    b_putf(&l, "mochi_array *%s = mochi_array_new();", name);
+    e_preline(em, l.s);
+    free(l.s);
+    for (int i = 0; i < n->nargs; i++) {
+        Buf pl; b_init(&pl);
+        if (n->args[i]->is_spread)
+            /* expand the runtime array's elements (mochi_val boxed) */
+            b_putf(&pl, "for (int __s%d = 0; __s%d < (%s)->len; __s%d++) mochi_array_push(%s, (%s)->items[__s%d]);",
+                   i, i, args[i].code, i, name, args[i].code, i);
+        else if (args[i].type == CT_STR)
+            b_putf(&pl, "mochi_array_push(%s, mochi_str(%s));", name, args[i].code);
+        else
+            b_putf(&pl, "mochi_array_push(%s, mochi_num(%s));", name, args[i].code);
+        e_preline(em, pl.s);
+        free(pl.s);
+    }
+    return name;
+}
+/* bounds-guarded read of parameter position `pos` from the materialized args */
+void emit_cargs_arg(Buf *b, const char *cargs, int pos, CmcType pt) {
+    if (pt == CT_STR)
+        b_putf(b, "((%s)->len > %d ? mochi_val_str(mochi_array_get(%s, %d)) : (const char *)0)",
+               cargs, pos, cargs, pos);
+    else if (pt == CT_BOOL)
+        b_putf(b, "((%s)->len > %d ? mochi_val_bool(mochi_array_get(%s, %d)) : 0)",
+               cargs, pos, cargs, pos);
+    else
+        b_putf(b, "((%s)->len > %d ? mochi_val_num(mochi_array_get(%s, %d)) : 0)",
+               cargs, pos, cargs, pos);
+}
+void emit_cargs_has(Buf *b, const char *cargs, int pos) {
+    b_putf(b, "((%s)->len > %d)", cargs, pos);
+}
+
 /* ---------------------- classes ---------------------- */
 
 /* env-free literal type inference for class fields / returns */
@@ -811,16 +860,30 @@ EStr emit_call(Emit *em, CmcNode *n) {
             if (s && s->kind == SYM_FUNC) {
                 b_putf(&b, "%s(", s->cname);
                 CmcNode *fn = s->func_node;
+                /* dynamic-arity call: materialize all args into a mochi_array */
+                int spread = has_call_spread(n);
+                const char *cargs = spread ? build_call_arg_array(em, n, args) : NULL;
                 if (fn && fn->kind == N_ARROW && fn->nparams > 0) {
                     /* nullish-guarded arrow: pass has_X, value for each param */
                     int np = fn->nparams;
                     for (int i = 0; i < np; i++) {
                         if (i) b_put(&b, ", ");
                         if (fn->params[i]->is_rest) {
-                            b_putf(&b, "%s", build_rest_array(em, args, i, n->nargs));
+                            if (spread)
+                                b_putf(&b, "mochi_array_slice(%s, %d, (%s)->len)", cargs, i, cargs);
+                            else
+                                b_putf(&b, "%s", build_rest_array(em, args, i, n->nargs));
                             continue;
                         }
-                        if (i < n->nargs) {
+                        CmcType pt = CT_DOUBLE;
+                        CmcNode *pn = fn->params[i];
+                        if (pn && pn->kind == N_IDENT) pt = infer_param_type_lite(em, fn, pn->name);
+                        else if (pn && pn->kind == N_ASSIGN && pn->lhs) pt = cmc_type_of(em->ctx, &em->env, pn->rhs);
+                        if (spread) {
+                            emit_cargs_has(&b, cargs, i);
+                            b_put(&b, ", ");
+                            emit_cargs_arg(&b, cargs, i, pt);
+                        } else if (i < n->nargs) {
                             Buf h; b_init(&h);
                             arg_has(em, n->args[i], &h);
                             b_putf(&b, "%s, ", h.s);
@@ -829,10 +892,6 @@ EStr emit_call(Emit *em, CmcNode *n) {
                             else co_num(em, &b, args[i]);
                         } else {
                             /* omitted arg: not present -> has=0, value 0/NULL */
-                            CmcType pt = CT_DOUBLE;
-                            CmcNode *pn = fn->params[i];
-                            if (pn && pn->kind == N_IDENT) pt = infer_param_type_lite(em, fn, pn->name);
-                            else if (pn && pn->kind == N_ASSIGN && pn->lhs) pt = cmc_type_of(em->ctx, &em->env, pn->rhs);
                             b_put(&b, pt == CT_STR ? "0, NULL" : "0, 0");
                         }
                     }
@@ -841,7 +900,16 @@ EStr emit_call(Emit *em, CmcNode *n) {
                     for (int i = 0; i < np; i++) {
                         if (i) b_put(&b, ", ");
                         if (fn && fn->params[i]->is_rest) {
-                            b_putf(&b, "%s", build_rest_array(em, args, i, n->nargs));
+                            if (spread)
+                                b_putf(&b, "mochi_array_slice(%s, %d, (%s)->len)", cargs, i, cargs);
+                            else
+                                b_putf(&b, "%s", build_rest_array(em, args, i, n->nargs));
+                        } else if (spread) {
+                            /* arity is runtime: read position i, bounds-guarded */
+                            CmcType pt = CT_DOUBLE;
+                            if (fn && i < fn->nparams && fn->params[i] && fn->params[i]->kind == N_IDENT)
+                                pt = infer_param_type_lite(em, fn, fn->params[i]->name);
+                            emit_cargs_arg(&b, cargs, i, pt);
                         } else if (i < n->nargs) {
                             if (args[i].type == CT_STR) co_str(em, &b, args[i]);
                             else co_num(em, &b, args[i]);
@@ -872,10 +940,24 @@ EStr emit_call(Emit *em, CmcNode *n) {
                     if (!em->m_guarded[mi]) {
                         /* class method: `this` (the object) is the first argument */
                         b_putf(&mb, "%s(%s", em->m_fn[mi], o.code);
+                        int mspread = has_call_spread(n);
+                        const char *mcargs = NULL;
+                        if (mspread) {
+                            EStr *margs = (EStr *)malloc(sizeof(EStr) * (n->nargs ? n->nargs : 1));
+                            for (int i = 0; i < n->nargs; i++) margs[i] = emit_expr(em, n->args[i]);
+                            mcargs = build_call_arg_array(em, n, margs);
+                            free(margs);
+                        }
                         int np_ = em->m_nparams[mi];
                         for (int i = 0; i < np_; i++) {
                             b_put(&mb, ", ");
-                            if (i < n->nargs) {
+                            if (mspread) {
+                                CmcType pt = CT_DOUBLE;
+                                CmcNode *mn = em->m_node[mi];
+                                if (mn && i < mn->nparams && mn->params[i])
+                                    pt = infer_param_type_lite(em, mn, mn->params[i]->name);
+                                emit_cargs_arg(&mb, mcargs, i, pt);
+                            } else if (i < n->nargs) {
                                 EStr ae = emit_expr(em, n->args[i]);
                                 if (ae.type == CT_STR) co_str(em, &mb, ae);
                                 else co_num(em, &mb, ae);
@@ -1093,6 +1175,14 @@ EStr emit_expr(Emit *em, CmcNode *n) {
    scope, so we record across the whole main body, then resolve from the
    first assignment we meet (string -> const char*, number -> double). */
 
+/* env-free: is this expression a string (literal, template, or concat)? */
+static int is_str_expr(CmcNode *a) {
+    if (!a) return 0;
+    if (a->kind == N_STR || a->kind == N_TEMPLATE) return 1;
+    if (a->kind == N_BIN && a->op == TK_PLUS)
+        return is_str_expr(a->lhs) || is_str_expr(a->rhs);
+    return 0;
+}
 CmcType fn_return_type(CmcNode *fn) {
     CmcType ret = CT_VOID;
     int saw = 0;
@@ -1112,6 +1202,7 @@ CmcType fn_return_type(CmcNode *fn) {
             else if (a->kind == N_NULL) t = CT_NULL;
             else if (a->kind == N_ARR) t = CT_ARR;
             else if (a->kind == N_OBJ) t = CT_OBJ;
+            else if (is_str_expr(a)) t = CT_STR; /* concat / template */
             if (ret == CT_VOID) ret = t;
             else if (t == CT_STR || ret == CT_STR) ret = CT_STR;
             else if (t == CT_DOUBLE || ret == CT_DOUBLE) ret = CT_DOUBLE;
@@ -1157,18 +1248,18 @@ CmcType fn_return_type(CmcNode *fn) {
 CmcType infer_param_type_lite(Emit *em, CmcNode *fn, const char *pname) {
     int has_double = 0, has_str = 0;
     CmcNode *stack[512]; int sp = 0;
-    stack[sp++] = fn;
+    stack[sp++] = fn->body ? fn->body : fn;
     while (sp) {
         CmcNode *cur = stack[--sp];
         if (!cur) continue;
         if (cur->kind == N_BIN) {
             if (cur->op == TK_SLASH) has_double = 1;
             if (cur->lhs->kind == N_IDENT && strcmp(cur->lhs->name, pname) == 0) {
-                if (cur->rhs->kind == N_STR) has_str = 1;
+                if (is_str_expr(cur->rhs)) has_str = 1;
                 else if (cur->rhs->kind == N_NUM && cur->rhs->num != (long long)cur->rhs->num) has_double = 1;
             }
             if (cur->rhs->kind == N_IDENT && strcmp(cur->rhs->name, pname) == 0) {
-                if (cur->lhs->kind == N_STR) has_str = 1;
+                if (is_str_expr(cur->lhs)) has_str = 1;
                 else if (cur->lhs->kind == N_NUM && cur->lhs->num != (long long)cur->lhs->num) has_double = 1;
             }
             stack[sp++] = cur->lhs; stack[sp++] = cur->rhs;
