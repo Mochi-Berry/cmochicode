@@ -758,10 +758,12 @@ static EStr emit_arrow(Emit *em, CmcNode *n) {
     const char *fnname = cmc_arena_strndup(em->ctx->arena, fnbuf, strlen(fnbuf));
     int np = n->nparams ? n->nparams : 0;
     CmcType *pt = (CmcType *)malloc(sizeof(CmcType) * (np ? np : 1));
+    int *prest = (int *)malloc(sizeof(int) * (np ? np : 1));
     /* resolve each param's name + whether it has a default */
     const char **pname = (const char **)malloc(sizeof(char *) * (np ? np : 1));
     CmcNode **pdef = (CmcNode **)malloc(sizeof(CmcNode *) * (np ? np : 1));
     for (int i = 0; i < np; i++) {
+        prest[i] = n->params[i]->is_rest ? 1 : 0;
         if (n->params[i]->kind == N_IDENT) {
             pname[i] = n->params[i]->name; pdef[i] = NULL;
             pt[i] = infer_param_type_lite(em, n, pname[i]);
@@ -786,6 +788,12 @@ static EStr emit_arrow(Emit *em, CmcNode *n) {
         snprintf(hasbuf, sizeof hasbuf, "has_%s", pname[i]);
         const char *hasname = cmc_arena_strndup(em->ctx->arena, hasbuf, strlen(hasbuf));
         if (i) b_put(&sig, ", ");
+        if (prest[i]) {
+            /* rest param: a real mochi_array* — args[]/args.length resolve like an array */
+            b_putf(&sig, "mochi_array *%s", pname[i]);
+            cmc_env_decl(&em->env, pname[i], CT_ARR, SYM_PARAM);
+            continue;
+        }
         b_putf(&sig, "int %s, %s %s", hasname, cmc_type_name(pt[i]), pname[i]);
         CmcSym *ps = cmc_env_decl(&em->env, pname[i], pt[i], SYM_PARAM);
         ps->has_name = hasname;
@@ -799,7 +807,7 @@ static EStr emit_arrow(Emit *em, CmcNode *n) {
     em->indent++;
     /* default-value resets: if (!has_X) X = default; */
     for (int i = 0; i < np; i++) {
-        if (!pdef[i]) continue;
+        if (!pdef[i] || prest[i]) continue;
         Buf dv; b_init(&dv);
         EStr de = emit_expr(em, pdef[i]);
         if (pt[i] == CT_STR) co_str(em, &dv, de);
@@ -944,6 +952,25 @@ static EStr emit_arr_higher(Emit *em, CmcNode *n, const char *prop, EStr o) {
     return estr("0", CT_INT, 0, 0, NULL);
 }
 
+/* pack args[ri..] into a fresh mochi_array (emitted as pre-lines); returns the name */
+static const char *build_rest_array(Emit *em, EStr *args, int ri, int nargs) {
+    const char *name = tmp_name(em, "rest");
+    Buf l; b_init(&l);
+    b_putf(&l, "mochi_array *%s = mochi_array_new();", name);
+    e_preline(em, l.s);
+    free(l.s);
+    for (int i = ri; i < nargs; i++) {
+        Buf pl; b_init(&pl);
+        if (args[i].type == CT_STR)
+            b_putf(&pl, "mochi_array_push(%s, mochi_str(%s));", name, args[i].code);
+        else
+            b_putf(&pl, "mochi_array_push(%s, mochi_num(%s));", name, args[i].code);
+        e_preline(em, pl.s);
+        free(pl.s);
+    }
+    return name;
+}
+
 static EStr emit_call(Emit *em, CmcNode *n) {
     CmcNode *callee = n->obj;
     if (callee->kind == N_IDENT) {
@@ -976,6 +1003,10 @@ static EStr emit_call(Emit *em, CmcNode *n) {
                     int np = fn->nparams;
                     for (int i = 0; i < np; i++) {
                         if (i) b_put(&b, ", ");
+                        if (fn->params[i]->is_rest) {
+                            b_putf(&b, "%s", build_rest_array(em, args, i, n->nargs));
+                            continue;
+                        }
                         if (i < n->nargs) {
                             Buf h; b_init(&h);
                             arg_has(em, n->args[i], &h);
@@ -993,10 +1024,15 @@ static EStr emit_call(Emit *em, CmcNode *n) {
                         }
                     }
                 } else {
-                    for (int i = 0; i < n->nargs; i++) {
+                    int np = fn && fn->nparams > 0 ? fn->nparams : n->nargs;
+                    for (int i = 0; i < np; i++) {
                         if (i) b_put(&b, ", ");
-                        if (args[i].type == CT_STR) co_str(em, &b, args[i]);
-                        else co_num(em, &b, args[i]);
+                        if (fn && fn->params[i]->is_rest) {
+                            b_putf(&b, "%s", build_rest_array(em, args, i, n->nargs));
+                        } else if (i < n->nargs) {
+                            if (args[i].type == CT_STR) co_str(em, &b, args[i]);
+                            else co_num(em, &b, args[i]);
+                        } else b_put(&b, "0");
                     }
                 }
                 b_put(&b, ")");
@@ -1259,8 +1295,11 @@ static void emit_var_decl(Emit *em, CmcNode *n) {
                 for (int j = 0; j < target->ndpat; j++) {
                     const char *key = target->dpat_keys[j]->str;
                     CmcNode *val = target->dpat_vals[j];
+                    CmcNode *dv = NULL;
+                    if (val->kind == N_ASSIGN) { dv = val->rhs; val = val->lhs; } /* default value */
                     if (val->kind != N_IDENT) continue;
-                    const char *ft = sname ? cmc_struct_field_type(sname, key) : "double";
+                    const char *ft = sname ? cmc_struct_field_type(sname, key) : NULL;
+                    int has_field = (ft != NULL);
                     if (!ft) ft = "double";
                     CmcType vt = CT_DOUBLE;
                     if (strcmp(ft, "int") == 0) vt = CT_INT;
@@ -1269,8 +1308,21 @@ static void emit_var_decl(Emit *em, CmcNode *n) {
                     else if (strcmp(ft, "const char *") == 0) vt = CT_STR;
                     else if (strcmp(ft, "mochi_array *") == 0) vt = CT_ARR;
                     cmc_env_decl(&em->env, val->name, vt, SYM_LOCAL);
-                    /* SROA: read the field directly, value stays in a register */
-                    e_linef(em, "%s %s = %s->%s;", ft, val->name, src.code, key);
+                    if (has_field) {
+                        /* SROA: read the field directly, value stays in a register */
+                        e_linef(em, "%s %s = %s->%s;", ft, val->name, src.code, key);
+                    } else {
+                        e_linef(em, "%s %s = %s;", ft, val->name, (vt == CT_STR) ? "NULL" :
+                                ((vt == CT_ARR) ? "NULL" : "0"));
+                    }
+                    /* best-effort default: struct fields default to 0 / NULL */
+                    if (dv) {
+                        EStr dvv = emit_expr(em, dv);
+                        if (vt == CT_STR)
+                            e_linef(em, "if (!%s) %s = (const char *)%s;", val->name, val->name, dvv.code);
+                        else
+                            e_linef(em, "if (%s == 0) %s = %s;", val->name, val->name, dvv.code);
+                    }
                 }
             } else {
                 for (int j = 0; j < target->nelems; j++) {
@@ -1683,7 +1735,10 @@ static void emit_function(Emit *em, CmcNode *fn) {
     b_putf(&sig, "static %s %s(", cmc_type_name(ret), fn->fname);
     for (int i = 0; i < fn->nparams; i++) {
         if (i) b_put(&sig, ", ");
-        if (fn->params[i]->kind == N_IDENT) {
+        if (fn->params[i]->is_rest && fn->params[i]->kind == N_IDENT) {
+            b_putf(&sig, "mochi_array *%s", fn->params[i]->name);
+            cmc_env_decl(&em->env, fn->params[i]->name, CT_ARR, SYM_PARAM);
+        } else if (fn->params[i]->kind == N_IDENT) {
             b_putf(&sig, "%s %s", cmc_type_name(pt[i]), fn->params[i]->name);
             cmc_env_decl(&em->env, fn->params[i]->name, pt[i], SYM_PARAM);
         } else b_put(&sig, "double p");
@@ -1723,6 +1778,7 @@ char *cmc_emit(CmcCtx *ctx, CmcNode *program) {
         if (ret == CT_VOID) ret = CT_INT;
         CmcSym *s = cmc_env_decl(&em.env, fns[i]->fname, ret, SYM_FUNC);
         s->cname = fns[i]->fname;
+        s->func_node = fns[i];
     }
 
     for (int i = 0; i < nfns; i++) {

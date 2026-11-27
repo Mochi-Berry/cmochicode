@@ -153,6 +153,7 @@ struct CmcNode {
     int         nparams;
     CmcNode    *body;        /* expression or block */
     int         is_async, is_expr_body;
+    int         is_rest;       /* rest param (...args) -> collects remaining args */
     /* function declaration */
     const char *fname;
     /* statements */

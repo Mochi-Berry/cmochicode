@@ -83,13 +83,16 @@ static CmcNode *parse_arrow_params(Parser *p) {
     int cap = 4, n = 0;
     CmcNode **params = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * cap);
     while (!check(p, TK_RPAREN)) {
-        if (check(p, TK_DOTDOTDOT)) { next(p); }
+        int rest = 0;
+        if (check(p, TK_DOTDOTDOT)) { next(p); rest = 1; }
         CmcNode *param = parse_binding_target(p);
+        if (rest) param->is_rest = 1;
         if (accept(p, TK_EQ)) {
             /* default value: wrap as N_ASSIGN-like marker — store rhs in third */
             CmcNode *def = new_node(p, N_ASSIGN);
             def->lhs = param;
             def->rhs = parse_expr(p, 2);
+            def->is_rest = 1;
             param = def;
         }
         if (n == cap) { cap *= 2; CmcNode **np = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * cap); memcpy(np, params, n * sizeof(CmcNode *)); params = np; }
@@ -171,7 +174,10 @@ static CmcNode *parse_primary(Parser *p) {
             int cap = 4, cnt = 0;
             CmcNode **params = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * cap);
             while (!check(p, TK_RPAREN)) {
+                int rest = 0;
+                if (check(p, TK_DOTDOTDOT)) { next(p); rest = 1; }
                 CmcNode *param = parse_binding_target(p);
+                if (rest) param->is_rest = 1;
                 if (accept(p, TK_EQ)) { CmcNode *def = new_node(p, N_ASSIGN); def->lhs = param; def->rhs = parse_expr(p, 2); param = def; }
                 if (cnt == cap) { cap *= 2; CmcNode **np = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * cap); memcpy(np, params, cnt * sizeof(CmcNode *)); params = np; }
                 params[cnt++] = param;
@@ -201,10 +207,16 @@ static CmcNode *parse_primary(Parser *p) {
             /* Could be arrow params or parenthesized expr. Parse comma list, then check for '=>'. */
             int cap = 4, cnt = 0;
             CmcNode **items = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * cap);
+            int rf = 0;
+            if (check(p, TK_DOTDOTDOT)) { next(p); rf = 1; }
             items[cnt++] = parse_expr(p, 1); /* prec 1: allow `b = 10` (default param / assign) */
+            if (rf && items[0]) items[0]->is_rest = 1;
             while (accept(p, TK_COMMA)) {
+                rf = 0;
+                if (check(p, TK_DOTDOTDOT)) { next(p); rf = 1; }
                 if (cnt == cap) { cap *= 2; CmcNode **np = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * cap); memcpy(np, items, cnt * sizeof(CmcNode *)); items = np; }
                 items[cnt++] = parse_expr(p, 1);
+                if (rf && items[cnt-1]) items[cnt-1]->is_rest = 1;
             }
             expect(p, TK_RPAREN);
             if (check(p, TK_ARROW)) {
@@ -645,7 +657,10 @@ static CmcNode *parse_stmt(Parser *p) {
             int cap = 4, cnt = 0;
             CmcNode **params = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * cap);
             while (!check(p, TK_RPAREN)) {
+                int rest = 0;
+                if (check(p, TK_DOTDOTDOT)) { next(p); rest = 1; }
                 CmcNode *param = parse_binding_target(p);
+                if (rest) param->is_rest = 1;
                 if (accept(p, TK_EQ)) { CmcNode *def = new_node(p, N_ASSIGN); def->lhs = param; def->rhs = parse_expr(p, 2); param = def; }
                 if (cnt == cap) { cap *= 2; CmcNode **np = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * cap); memcpy(np, params, cnt * sizeof(CmcNode *)); params = np; }
                 params[cnt++] = param;
