@@ -89,6 +89,56 @@ EStr emit_member_field(Emit *em, EStr o, CmcNode *obj_node, const char *prop, in
     return estr(b.s, CT_UNKNOWN, o.escapes, o.ptr, NULL);
 }
 
+/* ---- dynamic string-key dispatch for objects ----
+ * `obj[k]` with a runtime (non-const) key cannot be a static struct field
+ * access. We emit one pair of static helpers per shape that dispatch on the
+ * key string against the shape's known fields and box/unbox a mochi_val.
+ * Unknown keys read as null / write as no-op (the shape has no such field).
+ * This is the dynamic-typing path: statically-known keys still lower to a
+ * direct struct field access (the fast path); only genuinely runtime keys
+ * pay for the dispatch. */
+static char *dk_box(CmcType k, const char *expr) {
+    if (k == CT_STR) { Buf b; b_init(&b); b_putf(&b, "mochi_str(%s)", expr); return b.s; }
+    if (k == CT_BOOL) { Buf b; b_init(&b); b_putf(&b, "mochi_bool(%s)", expr); return b.s; }
+    if (k == CT_ARR) { Buf b; b_init(&b); b_putf(&b, "mochi_arr_box(%s)", expr); return b.s; }
+    if (k == CT_OBJ) { Buf b; b_init(&b); b_putf(&b, "mochi_obj_box(%s)", expr); return b.s; }
+    Buf b; b_init(&b); b_putf(&b, "mochi_num(%s)", expr); return b.s;
+}
+static const char *dk_unbox(CmcType k) {
+    if (k == CT_STR) return "mochi_val_str(v)";
+    if (k == CT_BOOL) return "mochi_val_bool(v)";
+    if (k == CT_ARR) return "v.p";   /* void* -> mochi_array* (implicit) */
+    if (k == CT_OBJ) return "v.p";   /* void* -> struct X* (implicit) */
+    return "mochi_val_num(v)";
+}
+void ensure_dk_helpers(Emit *em, const char *sn) {
+    if (!sn) return;
+    for (int i = 0; i < em->dk_n; i++)
+        if (strcmp(em->dk_shapes[i], sn) == 0) return;
+    if (em->dk_n < 64) em->dk_shapes[em->dk_n++] = sn;
+    Buf g; b_init(&g);
+    b_putf(&g, "static mochi_val %s_get(const struct %s *o, const char *k) {\n", sn, sn);
+    for (int f = 0; f < 64; f++) {
+        const char *fn = cmc_struct_field_name_n(sn, f);
+        if (!fn) break;
+        Buf rhs; b_init(&rhs); b_putf(&rhs, "o->%s", fn);
+        char *bx = dk_box(cmc_struct_field_kind(sn, fn), rhs.s);
+        b_putf(&g, "    if (!strcmp(k, \"%s\")) return %s;\n", fn, bx);
+        free(bx); free(rhs.s);
+    }
+    b_put(&g, "    return mochi_undef();\n}\n");
+    b_putf(&g, "static void %s_set(struct %s *o, const char *k, mochi_val v) {\n", sn, sn);
+    for (int f = 0; f < 64; f++) {
+        const char *fn = cmc_struct_field_name_n(sn, f);
+        if (!fn) break;
+        const char *ub = dk_unbox(cmc_struct_field_kind(sn, fn));
+        b_putf(&g, "    if (!strcmp(k, \"%s\")) { o->%s = %s; return; }\n", fn, fn, ub);
+    }
+    b_put(&g, "}\n\n");
+    b_put(&em->fn_extra, g.s);
+    free(g.s);
+}
+
 EStr emit_member(Emit *em, CmcNode *n) {
     EStr o = emit_expr(em, n->obj);
     if (n->computed) {
@@ -107,7 +157,16 @@ EStr emit_member(Emit *em, CmcNode *n) {
         if (o.type == CT_OBJ) {
             const char *k = kfold(em, n->prop);
             if (k) return emit_member_field(em, o, n->obj, k, n->optional);
-            fprintf(stderr, "cmochi:%d:%d: warning: dynamic computed key on object unsupported\n", n->line, n->col);
+            /* runtime key: dispatch via the shape's get helper (dynamic typing) */
+            if (o.struct_name) {
+                ensure_dk_helpers(em, o.struct_name);
+                Buf ks; b_init(&ks); co_str(em, &ks, idx);
+                Buf b; b_init(&b);
+                b_putf(&b, "%s_get(%s, %s)", o.struct_name, o.code, ks.s);
+                free(ks.s);
+                return estr(b.s, CT_MOCHI_VAL, 0, 0, NULL);
+            }
+            fprintf(stderr, "cmochi:%d:%d: warning: dynamic computed key on object unsupported (no static shape)\n", n->line, n->col);
             return estr("0", CT_UNKNOWN, 0, 0, NULL);
         }
         Buf b; b_init(&b);
@@ -318,7 +377,17 @@ EStr emit_assign(Emit *em, CmcNode *n) {
                     emit_member_assign(em, &b, o, k, r);
                     return estr(b.s, CT_UNKNOWN, 0, 0, NULL);
                 }
-                fprintf(stderr, "cmochi:%d:%d: warning: dynamic computed key on object unsupported\n", m->line, m->col);
+                /* runtime key: dispatch via the shape's set helper (dynamic typing) */
+                if (o.struct_name) {
+                    ensure_dk_helpers(em, o.struct_name);
+                    Buf ks; b_init(&ks); co_str(em, &ks, idx);
+                    Buf v; b_init(&v); co_box(&v, r);
+                    Buf b2; b_init(&b2);
+                    b_putf(&b2, "%s_set(%s, %s, %s)", o.struct_name, o.code, ks.s, v.s);
+                    free(ks.s); free(v.s);
+                    return estr(b2.s, CT_MOCHI_VAL, 0, 0, NULL);
+                }
+                fprintf(stderr, "cmochi:%d:%d: warning: dynamic computed key on object unsupported (no static shape)\n", m->line, m->col);
                 return estr("0", CT_UNKNOWN, 0, 0, NULL);
             }
             Buf v; b_init(&v); co_box(&v, r);

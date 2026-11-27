@@ -11,6 +11,8 @@ char *cmc_emit(CmcCtx *ctx, CmcNode *program) {
     b_init(&em.out);
     b_init(&em.structs);
     b_init(&em.pre);
+    b_init(&em.fn_extra);   /* file-scope helper slot (per-shape dispatch) */
+    cstr_count_pass(&em, program);   /* assignment counts first (invariance) */
     collect_cstr(&em, program);
 
     int nfns = 0, nmain = 0, ncls = 0;

@@ -38,7 +38,8 @@ typedef struct {
     const char *this_name;
     const char *cl_name[32]; const char *cl_struct[32]; const char *cl_ctor[32];
     int         cl_n;
-    const char *cstr_name[64]; const char *cstr_val[64]; int cstr_n;
+    const char *cstr_name[64]; const char *cstr_val[64]; int cstr_count[64]; int cstr_n;
+    const char *dk_shapes[64]; int dk_n;   /* shapes with runtime-key get/set helpers */
 } Emit;
 
 /* prototypes (all functions share the Emit/Buf/EStr types) */
@@ -66,6 +67,7 @@ void append_print_arg(Emit *em, CmcNode *node, EStr e, Buf *fmt, Buf *fargs);
 int expr_has_side_effect(CmcNode *n);
 const char *kfold(Emit *em, CmcNode *n);      /* fold expr -> const string, or NULL */
 void collect_cstr(Emit *em, CmcNode *n);      /* pre-pass: collect const string bindings */
+void cstr_count_pass(Emit *em, CmcNode *n);   /* pre-pass: count assignments per name */
 void emit_console(Emit *em, CmcNode **args, int nargs, int to_stderr);
 EStr emit_literal(Emit *em, CmcNode *n);
 EStr emit_ident(Emit *em, CmcNode *n);

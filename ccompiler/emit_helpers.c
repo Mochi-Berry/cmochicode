@@ -289,7 +289,45 @@ static void cstr_set(Emit *em, const char *name, const char *val) {
     if (em->cstr_n >= 64) return;
     em->cstr_name[em->cstr_n] = name;
     em->cstr_val[em->cstr_n] = val;
+    em->cstr_count[em->cstr_n] = 1;   /* a name the count pass missed: single set */
     em->cstr_n++;
+}
+/* count how many times each name is assigned (any value). A name is a
+ * compile-time constant string ONLY if it is assigned exactly once — a
+ * reassigned `var k = "a"; k = "b"` is NOT invariant, so it must not fold. */
+static void cstr_bump(Emit *em, const char *name) {
+    if (!name) return;
+    for (int i = 0; i < em->cstr_n; i++) {
+        if (strcmp(em->cstr_name[i], name) == 0) { em->cstr_count[i]++; return; }
+    }
+    if (em->cstr_n >= 64) return;
+    em->cstr_name[em->cstr_n] = name;
+    em->cstr_val[em->cstr_n] = NULL;
+    em->cstr_count[em->cstr_n] = 1;
+    em->cstr_n++;
+}
+void cstr_count_pass(Emit *em, CmcNode *n) {
+    if (!n) return;
+    if (n->kind == N_VAR) {
+        for (int i = 0; i < n->nstmts; i++) {
+            CmcNode *d = n->stmts[i];
+            if (d && d->kind == N_ASSIGN && d->lhs && d->lhs->kind == N_IDENT)
+                cstr_bump(em, d->lhs->name);
+        }
+    }
+    if (n->kind == N_ASSIGN && n->lhs && n->lhs->kind == N_IDENT)
+        cstr_bump(em, n->lhs->name);
+    cstr_count_pass(em, n->obj); cstr_count_pass(em, n->prop);
+    cstr_count_pass(em, n->lhs); cstr_count_pass(em, n->rhs); cstr_count_pass(em, n->third);
+    cstr_count_pass(em, n->body); cstr_count_pass(em, n->init); cstr_count_pass(em, n->test);
+    cstr_count_pass(em, n->update); cstr_count_pass(em, n->stmt);
+    for (int i = 0; i < n->nargs; i++) cstr_count_pass(em, n->args[i]);
+    for (int i = 0; i < n->nelems; i++) cstr_count_pass(em, n->elems[i]);
+    for (int i = 0; i < n->nprops; i++) cstr_count_pass(em, n->props[i].value);
+    for (int i = 0; i < n->nstmts; i++) cstr_count_pass(em, n->stmts[i]);
+    for (int i = 0; i < n->nquasis; i++) cstr_count_pass(em, n->quasis[i]);
+    for (int i = 0; i < n->nexprs; i++) cstr_count_pass(em, n->exprs[i]);
+    for (int i = 0; i < n->nparams; i++) cstr_count_pass(em, n->params[i]);
 }
 
 const char *kfold(Emit *em, CmcNode *n) {
@@ -299,7 +337,8 @@ const char *kfold(Emit *em, CmcNode *n) {
             return n->str;
         case N_IDENT:
             for (int i = 0; i < em->cstr_n; i++)
-                if (strcmp(em->cstr_name[i], n->name) == 0) return em->cstr_val[i];
+                if (strcmp(em->cstr_name[i], n->name) == 0)
+                    return (em->cstr_count[i] == 1) ? em->cstr_val[i] : NULL;
             return NULL;
         case N_BIN: {
             if (n->op != TK_PLUS) return NULL;
