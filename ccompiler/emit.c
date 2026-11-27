@@ -328,7 +328,8 @@ static EStr emit_member(Emit *em, CmcNode *n) {
         const char *ft = o.struct_name ? cmc_struct_field_type(o.struct_name, prop) : "double";
         if (!ft) ft = "double"; /* missing property -> 0 (undefined) */
         CmcType t = CT_UNKNOWN;
-        if (strcmp(ft, "int") == 0) t = CT_INT;
+        if (o.struct_name && cmc_struct_field_kind(o.struct_name, prop) == CT_BOOL) t = CT_BOOL;
+        else if (strcmp(ft, "int") == 0) t = CT_INT;
         else if (strcmp(ft, "int64_t") == 0) t = CT_INT64;
         else if (strcmp(ft, "double") == 0) t = CT_DOUBLE;
         else if (strcmp(ft, "const char *") == 0) t = CT_STR;
@@ -616,19 +617,75 @@ static EStr emit_array(Emit *em, CmcNode *n) {
 }
 
 static EStr emit_object(Emit *em, CmcNode *n) {
-    const char *sn = cmc_register_shape(em->ctx->arena, n);
     int np = n->nprops;
+    /* emit all values first so spread sources reveal their struct_name */
     EStr *vals = (EStr *)malloc(sizeof(EStr) * (np ? np : 1));
-    for (int i = 0; i < np; i++) vals[i] = (n->props[i].spread || n->props[i].key == NULL)
+    for (int i = 0; i < np; i++) vals[i] = (n->props[i].key == NULL && !n->props[i].spread)
         ? estr("0", CT_UNKNOWN, 0, 0, NULL) : emit_expr(em, n->props[i].value);
+    /* register the base shape (spread props skipped inside register_shape) */
+    const char *sn = cmc_register_shape(em->ctx->arena, n);
+    /* merge spread sources' fields into the shape, in prop order */
+    for (int i = 0; i < np; i++) {
+        CmcProp *pr = &n->props[i];
+        if (!pr->spread) continue;
+        const char *ss = vals[i].struct_name;
+        if (!ss) continue; /* unknown source type: cannot merge */
+        for (int f = 0; f < 64; f++) {
+            const char *fn = cmc_struct_field_name_n(ss, f);
+            if (!fn) break;
+            if (cmc_struct_field_type(sn, fn) == NULL)
+                cmc_shape_add_field(sn, fn, cmc_struct_field_kind(ss, fn));
+        }
+    }
+    /* reorder fields to JS insertion order (spread sources first, literal last) */
+    {
+        const char *order[64]; int on = 0;
+        for (int i = 0; i < np && on < 64; i++) {
+            CmcProp *pr = &n->props[i];
+            if (pr->spread) {
+                const char *ss = vals[i].struct_name;
+                if (!ss) continue;
+                for (int f = 0; f < 64 && on < 64; f++) {
+                    const char *fn = cmc_struct_field_name_n(ss, f);
+                    if (!fn) break;
+                    int dup = 0;
+                    for (int d = 0; d < on; d++) if (strcmp(order[d], fn) == 0) { dup = 1; break; }
+                    if (!dup) order[on++] = fn;
+                }
+            } else if (pr->key) {
+                int dup = 0;
+                for (int d = 0; d < on; d++) if (strcmp(order[d], pr->key) == 0) { dup = 1; break; }
+                if (!dup) order[on++] = pr->key;
+            }
+        }
+        if (on) cmc_shape_reorder(sn, order, on);
+    }
     const char *obj = tmp_name(em, "obj");
     Buf alloc; b_init(&alloc);
     b_putf(&alloc, "struct %s *%s = (struct %s *)CMC_ALLOC(sizeof(struct %s));", sn, obj, sn, sn);
     e_preline(em, alloc.s);
     free(alloc.s);
+    /* copy spread source fields, then literal props (later wins) */
     for (int i = 0; i < np; i++) {
         CmcProp *pr = &n->props[i];
-        if (pr->spread || pr->key == NULL) continue; /* spread: not merged in this build (documented) */
+        if (pr->spread) {
+            const char *ss = vals[i].struct_name;
+            if (!ss) continue;
+            for (int f = 0; f < 64; f++) {
+                const char *fn = cmc_struct_field_name_n(ss, f);
+                if (!fn) break;
+                const char *ft = cmc_struct_field_type(ss, fn);
+                Buf asg; b_init(&asg);
+                if (ft && strcmp(ft, "const char *") == 0)
+                    b_putf(&asg, "%s->%s = %s->%s;", obj, fn, vals[i].code, fn);
+                else
+                    b_putf(&asg, "%s->%s = %s->%s;", obj, fn, vals[i].code, fn);
+                e_preline(em, asg.s);
+                free(asg.s);
+            }
+            continue;
+        }
+        if (pr->key == NULL) continue;
         Buf v; b_init(&v);
         const char *ft = cmc_struct_field_type(sn, pr->key);
         if (!ft) ft = "double";

@@ -252,6 +252,29 @@ void cmc_shape_add_field(const char *struct_name, const char *field, CmcType t) 
     }
 }
 
+/* Reorder a shape's fields to match JS property insertion order (spread
+   sources first, then literal props). Kinds/names travel with the field. */
+void cmc_shape_reorder(const char *struct_name, const char **order, int n) {
+    for (int i = 0; i < g_shapes.n; i++) {
+        if (strcmp(g_shapes.shapes[i].name, struct_name) != 0) continue;
+        const char *oldn[32]; CmcType oldt[32];
+        int on = g_shapes.shapes[i].nfields;
+        for (int j = 0; j < on && j < 32; j++) { oldn[j] = g_shapes.shapes[i].field_names[j]; oldt[j] = g_shapes.shapes[i].field_types[j]; }
+        int w = 0;
+        for (int j = 0; j < n && w < 32; j++) {
+            for (int k = 0; k < on && k < 32; k++) {
+                if (strcmp(oldn[k], order[j]) == 0) {
+                    g_shapes.shapes[i].field_names[w] = oldn[k];
+                    g_shapes.shapes[i].field_types[w] = oldt[k];
+                    w++; break;
+                }
+            }
+        }
+        g_shapes.shapes[i].nfields = w;
+        return;
+    }
+}
+
 /* ------------------------- type inference ------------------------- */
 CmcType cmc_type_of(CmcCtx *ctx, CmcEnv *env, CmcNode *n) {
     if (!n) return CT_UNKNOWN;

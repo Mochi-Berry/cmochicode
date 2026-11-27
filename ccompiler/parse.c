@@ -323,8 +323,24 @@ static CmcNode *parse_postfix(Parser *p, CmcNode *base) {
             int cap = 4, cnt = 0;
             CmcNode **args = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * cap);
             while (!check(p, TK_RPAREN)) {
-                if (cnt == cap) { cap *= 2; CmcNode **np = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * cap); memcpy(np, args, cnt * sizeof(CmcNode *)); args = np; }
-                args[cnt++] = parse_expr(p, 2);
+                if (check(p, TK_DOTDOTDOT)) {
+                    /* call spread: only array literals are spliced (v0.1) */
+                    next(p);
+                    CmcNode *sp = parse_expr(p, 2);
+                    if (sp && sp->kind == N_ARR) {
+                        for (int j = 0; j < sp->nelems; j++) {
+                            if (cnt == cap) { cap *= 2; CmcNode **np = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * cap); memcpy(np, args, cnt * sizeof(CmcNode *)); args = np; }
+                            args[cnt++] = sp->elems[j];
+                        }
+                    } else {
+                        /* unknown spread source: keep as a single arg marker */
+                        if (cnt == cap) { cap *= 2; CmcNode **np = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * cap); memcpy(np, args, cnt * sizeof(CmcNode *)); args = np; }
+                        args[cnt++] = sp;
+                    }
+                } else {
+                    if (cnt == cap) { cap *= 2; CmcNode **np = (CmcNode **)cmc_arena_alloc(p->arena, sizeof(CmcNode *) * cap); memcpy(np, args, cnt * sizeof(CmcNode *)); args = np; }
+                    args[cnt++] = parse_expr(p, 2);
+                }
                 if (!accept(p, TK_COMMA)) break;
             }
             expect(p, TK_RPAREN);

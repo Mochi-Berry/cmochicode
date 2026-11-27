@@ -193,6 +193,7 @@ const char *cmc_register_shape(CmcArena *arena, CmcNode *obj);
 const char *cmc_struct_field_type(const char *struct_name, const char *field);
 const char *cmc_struct_field_type_n(const char *struct_name, int idx);
 CmcType   cmc_struct_field_kind(const char *struct_name, const char *field);
+void      cmc_shape_reorder(const char *struct_name, const char **order, int n);
 const char *cmc_struct_field_name_n(const char *struct_name, int idx);
 int         cmc_shape_count(void);
 const char *cmc_shape_name(int i);
