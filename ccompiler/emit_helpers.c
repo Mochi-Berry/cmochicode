@@ -185,6 +185,13 @@ void append_print_arg(Emit *em, CmcNode *node, EStr e, Buf *fmt, Buf *fargs) {
         farg_push(fargs, j.s);
         free(j.s);
     }
+    else if (e.type == CT_OBJ && e.struct_name && cmc_dk_is(e.struct_name)) {
+        /* shape with a dynamic overflow map: the generated formatter prints
+           the static fields plus the runtime map entries (JS order) */
+        b_put(fmt, "%s");
+        char t[160]; snprintf(t, sizeof t, "%s_str(%s)", e.struct_name, e.code);
+        farg_push(fargs, t);
+    }
     else if (e.type == CT_OBJ && e.struct_name) {
         b_put(fmt, "{ ");
         int first = 1;

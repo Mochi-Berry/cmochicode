@@ -123,6 +123,42 @@ static const char *dk_unbox(CmcType k) {
     if (k == CT_OBJ) return "v.p";   /* void* -> struct X* (implicit) */
     return "mochi_val_num(v)";
 }
+/* A string formatter for a shape with a dynamic overflow map: the static
+ * fields first, then the runtime map entries, so console.log(o) matches JS. */
+static void emit_dk_str_helper(Emit *em, const char *sn) {
+    Buf g; b_init(&g);
+    b_putf(&g, "static const char *%s_str(const struct %s *o) {\n", sn, sn);
+    b_putf(&g, "    static char buf[512];\n");
+    b_putf(&g, "    int off = 0; int first = 1;\n");
+    b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"{ \");\n");
+    for (int f = 0; f < 64; f++) {
+        const char *fn = cmc_struct_field_name_n(sn, f);
+        if (!fn) break;
+        const char *ft = cmc_struct_field_type_n(sn, f);
+        b_putf(&g, "    if (!first) off += snprintf(buf + off, sizeof buf - off, \", \"); first = 0;\n");
+        b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%s: \");\n", fn);
+        if (strcmp(ft, "const char *") == 0)
+            b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"'%%s'\", o->%s);\n", fn);
+        else if (strcmp(ft, "int") == 0 || strcmp(ft, "int64_t") == 0) {
+            if (cmc_struct_field_kind(sn, fn) == CT_BOOL)
+                b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%s\", o->%s ? \"true\" : \"false\");\n", fn);
+            else
+                b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%lld\", (long long)o->%s);\n", fn);
+        }
+        else if (strcmp(ft, "double") == 0)
+            b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%g\", o->%s);\n", fn);
+        else
+            b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%s\", mochi_val_str(o->%s));\n", fn);
+    }
+    b_put(&g, "    for (MochiMapEntry *e = o->extra ? o->extra->head : NULL; e; e = e->next) {\n");
+    b_put(&g, "        if (!first) off += snprintf(buf + off, sizeof buf - off, \", \"); first = 0;\n");
+    b_put(&g, "        off += snprintf(buf + off, sizeof buf - off, \"%s: %s\", e->key, mochi_val_str_js(e->val));\n");
+    b_put(&g, "    }\n");
+    b_put(&g, "    snprintf(buf + off, sizeof buf - off, \" }\");\n");
+    b_put(&g, "    return buf;\n}\n\n");
+    b_put(&em->fn_extra, g.s);
+    free(g.s);
+}
 void ensure_dk_helpers(Emit *em, const char *sn) {
     if (!sn) return;
     for (int i = 0; i < em->dk_n; i++)
@@ -152,6 +188,7 @@ void ensure_dk_helpers(Emit *em, const char *sn) {
     b_put(&g, "    mochi_map_set(o->extra, k, v);\n}\n\n");
     b_put(&em->fn_extra, g.s);
     free(g.s);
+    emit_dk_str_helper(em, sn);
 }
 
 EStr emit_member(Emit *em, CmcNode *n) {
@@ -340,6 +377,16 @@ static void emit_member_assign(Emit *em, Buf *b, EStr o, const char *prop, EStr 
     Buf base; b_init(&base); member_base(em, &base, o);
     Buf rv; b_init(&rv);
     const char *ft = o.struct_name ? cmc_struct_field_type(o.struct_name, prop) : NULL;
+    if (!ft && o.struct_name && cmc_dk_is(o.struct_name)) {
+        /* The shape has a dynamic overflow map: keep this key OUT of the
+         * struct so the map preserves JS insertion order (and so a literal
+         * key and a runtime key interleave the way JS does). */
+        ensure_dk_helpers(em, o.struct_name);
+        Buf v; b_init(&v); co_box(&v, r);
+        b_putf(b, "%s_set(%s, \"%s\", %s)", o.struct_name, o.code, prop, v.s);
+        free(v.s); free(base.s);
+        return;
+    }
     if (!ft && o.struct_name) {
         /* JS allows point.label = "P" on a shape that only had {x, y}:
          * merge the field into the registered shape so the struct def
@@ -347,6 +394,7 @@ static void emit_member_assign(Emit *em, Buf *b, EStr o, const char *prop, EStr 
         CmcType vt = r.type;
         if (vt == CT_UNKNOWN) vt = CT_DOUBLE;
         cmc_shape_add_field(o.struct_name, prop, vt);
+        cmc_shape_mark_promoted(o.struct_name, prop);
         ft = cmc_struct_field_type(o.struct_name, prop);
     }
     if (o.struct_name && ft && strcmp(ft, "mochi_val") != 0) {

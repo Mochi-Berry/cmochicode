@@ -66,13 +66,13 @@ static mochi_val mochi_undef(void);
  * runtime expression (obj[k] = v): the static struct fields are checked
  * first, then this lazily-allocated map keeps the rest. */
 typedef struct MochiMapEntry { const char *key; mochi_val val; struct MochiMapEntry *next; } MochiMapEntry;
-typedef struct { MochiMapEntry *head; size_t len; } mochi_map;
+typedef struct { MochiMapEntry *head; MochiMapEntry *tail; size_t len; } mochi_map;
 static const char *mochi_map_strdup(const char *s) {
     size_t n = strlen(s) + 1; char *d = (char *)CMC_ALLOC(n); memcpy(d, s, n); return d;
 }
 static mochi_map *mochi_map_new(void) {
     mochi_map *m = (mochi_map *)CMC_ALLOC(sizeof(mochi_map));
-    m->head = NULL; m->len = 0; return m;
+    m->head = NULL; m->tail = NULL; m->len = 0; return m;
 }
 static mochi_val mochi_map_get(mochi_map *m, const char *k) {
     for (MochiMapEntry *e = m->head; e; e = e->next)
@@ -89,13 +89,19 @@ static void mochi_map_set(mochi_map *m, const char *k, mochi_val v) {
     for (MochiMapEntry *e = m->head; e; e = e->next)
         if (strcmp(e->key, k) == 0) { e->val = v; return; }
     MochiMapEntry *e = (MochiMapEntry *)CMC_ALLOC(sizeof(MochiMapEntry));
-    e->key = mochi_map_strdup(k); e->val = v; e->next = m->head; m->head = e; m->len++;
+    e->key = mochi_map_strdup(k); e->val = v; e->next = NULL;
+    if (m->tail) m->tail->next = e; else m->head = e;
+    m->tail = e; m->len++;
 }
 static void mochi_map_del(mochi_map *m, const char *k) {
-    MochiMapEntry **pp = &m->head;
-    while (*pp) {
-        if (strcmp((*pp)->key, k) == 0) { *pp = (*pp)->next; m->len--; return; }
-        pp = &(*pp)->next;
+    MochiMapEntry *prev = NULL, *e = m->head;
+    while (e) {
+        if (strcmp(e->key, k) == 0) {
+            if (prev) prev->next = e->next; else m->head = e->next;
+            if (m->tail == e) m->tail = prev;
+            m->len--; return;
+        }
+        prev = e; e = e->next;
     }
 }
 static size_t mochi_map_len(mochi_map *m) { return m ? m->len : 0; }
@@ -110,6 +116,14 @@ static inline mochi_val mochi_undef(void)        { mochi_val x; x.t=6; x.n=0; x.
 static inline mochi_val mochi_arr_box(mochi_array *a){ mochi_val x; x.t=4; x.n=0; x.s=0; x.p=a; return x; }
 static inline mochi_val mochi_obj_box(void *o)   { mochi_val x; x.t=5; x.n=0; x.s=0; x.p=o; return x; }
 static inline double mochi_val_num(mochi_val v)  { return v.t==1 ? atof(v.s) : v.n; }
+/* JS-style value repr: strings get quotes, numbers/bools/null as-is —
+ * matches how node prints an object value. */
+static inline const char *mochi_val_str(mochi_val v);
+static inline const char *mochi_val_str_js(mochi_val v){
+    if (v.t==1) { static char sb[4][256]; static int si=0; si=(si+1)&3;
+        snprintf(sb[si],256,"'%s'", v.s); return sb[si]; }
+    return mochi_val_str(v);
+}
 static inline const char *mochi_val_str(mochi_val v){
     if (v.t==1) return v.s;
     if (v.t==0) { static char b[4][32]; static int bi=0; bi=(bi+1)&3; snprintf(b[bi],32,"%g",v.n); return b[bi]; }

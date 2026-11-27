@@ -265,6 +265,39 @@ int cmc_dk_is(const char *sn) {
     return 0;
 }
 
+/* Fields added by member-assign promotion. A shape that ends up with a
+ * dynamic overflow map (dk) must NOT keep these as static fields, or the
+ * console.log order would diverge from JS insertion order and the map would
+ * be bypassed. We record the promotion, then at the end of the dry passes
+ * (cmc_shape_flush_promotions) drop the field from any shape that became dk. */
+typedef struct { const char *shape; const char *field; } CmcPromoted;
+static CmcPromoted g_promoted[128]; static int g_promoted_n = 0;
+void cmc_shape_mark_promoted(const char *sn, const char *field) {
+    if (!sn || !field) return;
+    for (int i = 0; i < g_promoted_n; i++)
+        if (g_promoted[i].shape == sn && g_promoted[i].field == field) return;
+    if (g_promoted_n < 128) { g_promoted[g_promoted_n].shape = sn; g_promoted[g_promoted_n].field = field; g_promoted_n++; }
+}
+void cmc_shape_remove_field(const char *sn, const char *field) {
+    for (int i = 0; i < g_shapes.n; i++) {
+        if (strcmp(g_shapes.shapes[i].name, sn) != 0) continue;
+        for (int j = 0; j < g_shapes.shapes[i].nfields; j++)
+            if (strcmp(g_shapes.shapes[i].field_names[j], field) == 0) {
+                for (int k = j; k < g_shapes.shapes[i].nfields - 1; k++) {
+                    g_shapes.shapes[i].field_names[k] = g_shapes.shapes[i].field_names[k+1];
+                    g_shapes.shapes[i].field_types[k] = g_shapes.shapes[i].field_types[k+1];
+                }
+                g_shapes.shapes[i].nfields--;
+                return;
+            }
+        return;
+    }
+}
+void cmc_shape_flush_promotions(void) {
+    for (int i = 0; i < g_promoted_n; i++)
+        if (cmc_dk_is(g_promoted[i].shape))
+            cmc_shape_remove_field(g_promoted[i].shape, g_promoted[i].field);
+}
 /* Call-site shape inference for polymorphic object params: a function
  * parameter that receives an object at a call site gets the object's shape,
  * so `fill(q)` with q = {v:1} types fill's `q` as `struct <shape> *`. */

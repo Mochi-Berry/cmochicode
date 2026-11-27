@@ -95,6 +95,11 @@ char *cmc_emit(CmcCtx *ctx, CmcNode *program) {
     emit_pass(&dry2, ctx, program);
     free(dry2.out.s); free(dry2.structs.s); free(dry2.pre.s); free(dry2.fn_extra.s);
 
+    /* A shape that turned out to use a dynamic overflow map must not keep its
+     * member-assign-promoted fields as static struct fields: those keys belong
+     * in the map so JS insertion order (and the S_get/S_set dispatch) holds. */
+    cmc_shape_flush_promotions();
+
     /* pass 2 (real): the shapes are final; emit the actual program. */
     Emit em;
     memset(&em, 0, sizeof(em));
