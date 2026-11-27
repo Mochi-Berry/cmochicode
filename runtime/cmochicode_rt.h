@@ -60,6 +60,47 @@ static void mochi_throw(const char *msg) {
 
 /* ---------- tagged value + dynamic array ---------- */
 typedef struct { unsigned char t; double n; const char *s; void *p; } mochi_val;
+static mochi_val mochi_undef(void);
+/* ---------- dynamic string-key map (overflow storage) ---------- */
+/* A shape object may need to hold keys that were only ever written through a
+ * runtime expression (obj[k] = v): the static struct fields are checked
+ * first, then this lazily-allocated map keeps the rest. */
+typedef struct MochiMapEntry { const char *key; mochi_val val; struct MochiMapEntry *next; } MochiMapEntry;
+typedef struct { MochiMapEntry *head; size_t len; } mochi_map;
+static const char *mochi_map_strdup(const char *s) {
+    size_t n = strlen(s) + 1; char *d = (char *)CMC_ALLOC(n); memcpy(d, s, n); return d;
+}
+static mochi_map *mochi_map_new(void) {
+    mochi_map *m = (mochi_map *)CMC_ALLOC(sizeof(mochi_map));
+    m->head = NULL; m->len = 0; return m;
+}
+static mochi_val mochi_map_get(mochi_map *m, const char *k) {
+    for (MochiMapEntry *e = m->head; e; e = e->next)
+        if (strcmp(e->key, k) == 0) return e->val;
+    return mochi_undef();
+}
+static int mochi_map_has(mochi_map *m, const char *k) {
+    for (MochiMapEntry *e = m->head; e; e = e->next)
+        if (strcmp(e->key, k) == 0) return 1;
+    return 0;
+}
+static void mochi_map_set(mochi_map *m, const char *k, mochi_val v) {
+    if (!k) return;
+    for (MochiMapEntry *e = m->head; e; e = e->next)
+        if (strcmp(e->key, k) == 0) { e->val = v; return; }
+    MochiMapEntry *e = (MochiMapEntry *)CMC_ALLOC(sizeof(MochiMapEntry));
+    e->key = mochi_map_strdup(k); e->val = v; e->next = m->head; m->head = e; m->len++;
+}
+static void mochi_map_del(mochi_map *m, const char *k) {
+    MochiMapEntry **pp = &m->head;
+    while (*pp) {
+        if (strcmp((*pp)->key, k) == 0) { *pp = (*pp)->next; m->len--; return; }
+        pp = &(*pp)->next;
+    }
+}
+static size_t mochi_map_len(mochi_map *m) { return m ? m->len : 0; }
+
+
 typedef struct { int len, cap; mochi_val *items; } mochi_array;
 static inline mochi_val mochi_num(double v)      { mochi_val x; x.t=0; x.n=v; x.s=0; x.p=0; return x; }
 static inline mochi_val mochi_str(const char *v) { mochi_val x; x.t=1; x.n=0; x.s=v; x.p=0; return x; }

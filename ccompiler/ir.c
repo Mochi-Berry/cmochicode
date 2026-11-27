@@ -248,6 +248,23 @@ const char *cmc_shape_field_type(int i, int j) {
 
 /* Merge a dynamically-assigned field into a registered shape (JS allows
  * point.label = "P" on an object literal that only had {x, y}). */
+/* Shapes that use dynamic-key dispatch (and thus need the `extra` overflow
+ * map field in their struct). Global across passes: the dry pass discovers the
+ * need, the real pass's literal allocation (which runs before the dynamic-key
+ * use) must still know to init `extra` to NULL. */
+static const char *g_dk_shapes[64];
+static int g_dk_shapes_n = 0;
+void cmc_dk_register(const char *sn) {
+    if (!sn) return;
+    for (int i = 0; i < g_dk_shapes_n; i++) if (strcmp(g_dk_shapes[i], sn) == 0) return;
+    if (g_dk_shapes_n < 64) g_dk_shapes[g_dk_shapes_n++] = sn;
+}
+int cmc_dk_is(const char *sn) {
+    if (!sn) return 0;
+    for (int i = 0; i < g_dk_shapes_n; i++) if (strcmp(g_dk_shapes[i], sn) == 0) return 1;
+    return 0;
+}
+
 /* Call-site shape inference for polymorphic object params: a function
  * parameter that receives an object at a call site gets the object's shape,
  * so `fill(q)` with q = {v:1} types fill's `q` as `struct <shape> *`. */

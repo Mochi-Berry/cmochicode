@@ -32,6 +32,8 @@ EStr emit_ident(Emit *em, CmcNode *n) {
     return estr(n->name, CT_UNKNOWN, 0, 0, NULL);
 }
 
+void ensure_dk_helpers(Emit *em, const char *sn);
+
 EStr emit_member_field(Emit *em, EStr o, CmcNode *obj_node, const char *prop, int optional) {
     if (o.type == CT_ARR && strcmp(prop, "length") == 0) {
         Buf b; b_init(&b);
@@ -59,10 +61,19 @@ EStr emit_member_field(Emit *em, EStr o, CmcNode *obj_node, const char *prop, in
             }
         }
     if (o.type == CT_OBJ) {
+        /* Unknown static key: dispatch via the shape's get helper so the
+         * dynamic overflow map is consulted instead of a bogus field read. */
+        const char *hasf = o.struct_name ? cmc_struct_field_type(o.struct_name, prop) : NULL;
+        if (!hasf && o.struct_name) {
+            ensure_dk_helpers(em, o.struct_name);
+            Buf b; b_init(&b);
+            b_putf(&b, "%s_get(%s, \"%s\")", o.struct_name, o.code, prop);
+            return estr(b.s, CT_MOCHI_VAL, 0, 0, NULL);
+        }
         Buf b; b_init(&b);
         member_base(em, &b, o);
         b_put(&b, prop);
-        const char *ft = o.struct_name ? cmc_struct_field_type(o.struct_name, prop) : "double";
+        const char *ft = hasf;
         if (!ft) ft = "double"; /* missing property -> 0 (undefined) */
         CmcType t = CT_UNKNOWN;
         if (o.struct_name && cmc_struct_field_kind(o.struct_name, prop) == CT_BOOL) t = CT_BOOL;
@@ -117,6 +128,7 @@ void ensure_dk_helpers(Emit *em, const char *sn) {
     for (int i = 0; i < em->dk_n; i++)
         if (strcmp(em->dk_shapes[i], sn) == 0) return;
     if (em->dk_n < 64) em->dk_shapes[em->dk_n++] = sn;
+    cmc_dk_register(sn);
     Buf g; b_init(&g);
     b_putf(&g, "static mochi_val %s_get(const struct %s *o, const char *k) {\n", sn, sn);
     for (int f = 0; f < 64; f++) {
@@ -127,6 +139,7 @@ void ensure_dk_helpers(Emit *em, const char *sn) {
         b_putf(&g, "    if (!strcmp(k, \"%s\")) return %s;\n", fn, bx);
         free(bx); free(rhs.s);
     }
+    b_put(&g, "    if (o->extra) return mochi_map_get(o->extra, k);\n");
     b_put(&g, "    return mochi_undef();\n}\n");
     b_putf(&g, "static void %s_set(struct %s *o, const char *k, mochi_val v) {\n", sn, sn);
     for (int f = 0; f < 64; f++) {
@@ -135,7 +148,8 @@ void ensure_dk_helpers(Emit *em, const char *sn) {
         const char *ub = dk_unbox(cmc_struct_field_kind(sn, fn));
         b_putf(&g, "    if (!strcmp(k, \"%s\")) { o->%s = %s; return; }\n", fn, fn, ub);
     }
-    b_put(&g, "}\n\n");
+    b_put(&g, "    if (!o->extra) o->extra = mochi_map_new();\n");
+    b_put(&g, "    mochi_map_set(o->extra, k, v);\n}\n\n");
     b_put(&em->fn_extra, g.s);
     free(g.s);
 }
@@ -557,6 +571,8 @@ EStr emit_object(Emit *em, CmcNode *n) {
     b_putf(&alloc, "struct %s *%s = (struct %s *)CMC_ALLOC(sizeof(struct %s));", sn, obj, sn, sn);
     e_preline(em, alloc.s);
     free(alloc.s);
+    if (cmc_dk_is(sn)) { Buf xinit; b_init(&xinit); b_putf(&xinit, "%s->extra = NULL;", obj);
+                         e_preline(em, xinit.s); free(xinit.s); }
     /* flush pending pre-lines now: a lifted method fn must not capture them */
     flush_pre(em);
     /* copy spread source fields, then literal props (later wins) */

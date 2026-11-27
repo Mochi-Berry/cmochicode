@@ -124,6 +124,7 @@ char *cmc_emit(CmcCtx *ctx, CmcNode *program) {
             if (!fn || !ft) continue;
             b_putf(&em.structs, "    %s %s;\n", ft, fn);
         }
+        if (cmc_dk_is(sn)) b_putf(&em.structs, "    mochi_map *extra;\n");
         b_putf(&em.structs, "} %s;\n\n", sn);
     }
     if (em.structs.len) { b_put(&out, em.structs.s); b_put(&out, "\n"); }
