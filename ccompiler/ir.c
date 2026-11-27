@@ -244,6 +244,22 @@ const char *cmc_shape_field_type(int i, int j) {
 
 /* Merge a dynamically-assigned field into a registered shape (JS allows
  * point.label = "P" on an object literal that only had {x, y}). */
+/* Change an existing field's type (e.g. widen int -> double, or any static
+ * type -> CT_MOCHI_VAL when a value of an incompatible type is assigned).
+ * The struct definition is emitted AFTER the whole body, so this is visible
+ * to every read in the program once a pass has run. */
+void cmc_shape_widen_field(const char *struct_name, const char *field, CmcType t) {
+    for (int i = 0; i < g_shapes.n; i++) {
+        if (strcmp(g_shapes.shapes[i].name, struct_name) != 0) continue;
+        for (int j = 0; j < g_shapes.shapes[i].nfields; j++)
+            if (strcmp(g_shapes.shapes[i].field_names[j], field) == 0) {
+                g_shapes.shapes[i].field_types[j] = t;
+                return;
+            }
+        return;
+    }
+}
+
 void cmc_shape_add_field(const char *struct_name, const char *field, CmcType t) {
     for (int i = 0; i < g_shapes.n; i++) {
         if (strcmp(g_shapes.shapes[i].name, struct_name) != 0) continue;
@@ -275,6 +291,17 @@ void cmc_shape_reorder(const char *struct_name, const char **order, int n) {
                     w++; break;
                 }
             }
+        }
+        /* Fields that were added dynamically (o.x = 1) are not part of the
+         * literal's insertion order: keep them (and their current type)
+         * instead of dropping them from the shape. */
+        for (int k = 0; k < on && w < 32; k++) {
+            int listed = 0;
+            for (int j = 0; j < n; j++) if (strcmp(oldn[k], order[j]) == 0) { listed = 1; break; }
+            if (listed) continue;
+            g_shapes.shapes[i].field_names[w] = oldn[k];
+            g_shapes.shapes[i].field_types[w] = oldt[k];
+            w++;
         }
         g_shapes.shapes[i].nfields = w;
         return;

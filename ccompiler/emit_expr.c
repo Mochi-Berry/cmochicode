@@ -71,6 +71,7 @@ EStr emit_member_field(Emit *em, EStr o, CmcNode *obj_node, const char *prop, in
         else if (strcmp(ft, "double") == 0) t = CT_DOUBLE;
         else if (strcmp(ft, "const char *") == 0) t = CT_STR;
         else if (strcmp(ft, "mochi_array *") == 0) t = CT_ARR;
+        else if (strcmp(ft, "mochi_val") == 0) t = CT_MOCHI_VAL;
         else t = CT_UNKNOWN;
         /* optional chaining `user?.id`: yield 0/NULL instead of crashing */
         if (optional) {
@@ -297,6 +298,30 @@ EStr emit_unary(Emit *em, CmcNode *n) {
     }
 }
 
+/* The hybrid static/dynamic typing rule: a field's static type can only be
+ * kept when the assigned value fits it faithfully. int -> double / int64 is
+ * a static promotion (fast path kept); any genuinely incompatible pair (a
+ * number field given a string, a string field given a number, etc.) widens
+ * to CT_MOCHI_VAL — the dynamic tagged value. */
+static CmcType widen_field_type(CmcType fk, CmcType rt) {
+    if (fk == rt) return fk;
+    if (rt == CT_UNKNOWN) return fk;
+    if (fk == CT_INT && rt == CT_DOUBLE) return CT_DOUBLE;
+    if (fk == CT_INT && rt == CT_INT64) return CT_INT64;
+    if (fk == CT_BOOL && rt == CT_DOUBLE) return CT_DOUBLE;
+    if (fk == CT_BOOL && rt == CT_INT) return CT_INT;
+    if (fk == CT_BOOL && rt == CT_INT64) return CT_INT64;
+    if (fk == CT_MOCHI_VAL) return CT_MOCHI_VAL;
+    if (fk == CT_NULL || fk == CT_UNDEF) return fk;
+    if (cmc_is_numeric(fk) && (rt == CT_STR || rt == CT_BOOL || rt == CT_ARR ||
+        rt == CT_OBJ || rt == CT_NULL || rt == CT_UNDEF || rt == CT_MOCHI_VAL)) return CT_MOCHI_VAL;
+    if (fk == CT_STR && (cmc_is_numeric(rt) || rt == CT_BOOL || rt == CT_ARR ||
+        rt == CT_OBJ || rt == CT_NULL || rt == CT_UNDEF || rt == CT_MOCHI_VAL)) return CT_MOCHI_VAL;
+    if ((fk == CT_ARR || fk == CT_OBJ) && !(rt == CT_ARR || rt == CT_OBJ || rt == CT_NULL || rt == CT_UNDEF))
+        return CT_MOCHI_VAL;
+    return fk;
+}
+
 static void emit_member_assign(Emit *em, Buf *b, EStr o, const char *prop, EStr r) {
     Buf base; b_init(&base); member_base(em, &base, o);
     Buf rv; b_init(&rv);
@@ -310,7 +335,16 @@ static void emit_member_assign(Emit *em, Buf *b, EStr o, const char *prop, EStr 
         cmc_shape_add_field(o.struct_name, prop, vt);
         ft = cmc_struct_field_type(o.struct_name, prop);
     }
-    if (ft && strcmp(ft, "const char *") == 0) co_str(em, &rv, r);
+    if (o.struct_name && ft && strcmp(ft, "mochi_val") != 0) {
+        CmcType fk = cmc_struct_field_kind(o.struct_name, prop);
+        CmcType target = widen_field_type(fk, r.type);
+        if (target != fk) {
+            cmc_shape_widen_field(o.struct_name, prop, target);
+            ft = cmc_struct_field_type(o.struct_name, prop);
+        }
+    }
+    if (ft && strcmp(ft, "mochi_val") == 0) co_box(&rv, r);
+    else if (ft && strcmp(ft, "const char *") == 0) co_str(em, &rv, r);
     else if (ft && strcmp(ft, "int") == 0) co_int(&rv, r);
     else if (ft && strcmp(ft, "int64_t") == 0) { if (r.type == CT_INT64) b_put(&rv, r.code); else b_putf(&rv, "(int64_t)(%s)", r.code); }
     else if (ft && strcmp(ft, "double") == 0) co_num(em, &rv, r);
@@ -564,7 +598,8 @@ EStr emit_object(Emit *em, CmcNode *n) {
         Buf v; b_init(&v);
         const char *ft = cmc_struct_field_type(sn, pr->key);
         if (!ft) ft = "double";
-        if (strcmp(ft, "const char *") == 0) co_str(em, &v, vals[i]);
+        if (strcmp(ft, "mochi_val") == 0) co_box(&v, vals[i]);
+        else if (strcmp(ft, "const char *") == 0) co_str(em, &v, vals[i]);
         else if (strcmp(ft, "int") == 0) co_int(&v, vals[i]);
         else if (strcmp(ft, "int64_t") == 0) { if (vals[i].type == CT_INT64) b_put(&v, vals[i].code); else b_putf(&v, "(int64_t)(%s)", vals[i].code); }
         else if (strcmp(ft, "double") == 0) co_num(em, &v, vals[i]);

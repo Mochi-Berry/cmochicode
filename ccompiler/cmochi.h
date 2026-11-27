@@ -204,6 +204,7 @@ int         cmc_shape_field_count(int i);
 const char *cmc_shape_field_name(int i, int j);
 const char *cmc_shape_field_type(int i, int j);
 void        cmc_shape_add_field(const char *struct_name, const char *field, CmcType t);
+void        cmc_shape_widen_field(const char *struct_name, const char *field, CmcType t);
 
 /* A lowered statement/expression carrying a C type + escape info. */
 typedef enum {

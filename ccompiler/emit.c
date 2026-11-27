@@ -3,7 +3,84 @@
  * emit_helpers.c / emit_expr.c / emit_stmt.c / emit_class.c. */
 #include "emit_internal.h"
 
+/* One full emission pass over the program into em->out (and em->structs /
+ * em->fn_extra). The global shape registry is mutated as a side effect, so a
+ * first "dry" pass can discover type conflicts and widen fields BEFORE the
+ * real pass emits reads that must already use the final (possibly dynamic)
+ * field type. */
+static void emit_pass(Emit *em, CmcCtx *ctx, CmcNode *program) {
+    cstr_count_pass(em, program);   /* assignment counts first (invariance) */
+    collect_cstr(em, program);
+
+    int nfns = 0, nmain = 0, ncls = 0;
+    CmcNode **fns = (CmcNode **)malloc(sizeof(CmcNode *) * (program->nstmts ? program->nstmts : 1));
+    CmcNode **classes = (CmcNode **)malloc(sizeof(CmcNode *) * (program->nstmts ? program->nstmts : 1));
+    CmcNode **main_body = (CmcNode **)malloc(sizeof(CmcNode *) * (program->nstmts ? program->nstmts : 1));
+    for (int i = 0; i < program->nstmts; i++) {
+        CmcNodeKind k = program->stmts[i]->kind;
+        if (k == N_FUNC) fns[nfns++] = program->stmts[i];
+        else if (k == N_CLASS) classes[ncls++] = program->stmts[i];
+        else main_body[nmain++] = program->stmts[i];
+    }
+
+    /* classes first: their methods must exist before any function that uses `new` */
+    for (int i = 0; i < ncls; i++) emit_class(em, classes[i]);
+
+    /* hoist function symbols so recursion/forward calls resolve */
+    for (int i = 0; i < nfns; i++) {
+        CmcType ret = fn_return_type(fns[i]);
+        if (ret == CT_VOID) ret = CT_INT;
+        CmcSym *s = cmc_env_decl(&em->env, fns[i]->fname, ret, SYM_FUNC);
+        s->cname = fns[i]->fname;
+        s->func_node = fns[i];
+    }
+
+    for (int i = 0; i < nfns; i++) {
+        em->cur_fn = fns[i];
+        emit_function(em, fns[i]);
+        em->cur_fn = NULL;
+    }
+
+    em->cur_fn = NULL;
+    /* deferred-type pre-pass: `var x;` gets its type from first assignment */
+    {
+        CmcNode mb; memset(&mb, 0, sizeof(mb));
+        mb.kind = N_BLOCK; mb.stmts = main_body; mb.nstmts = nmain;
+        uninit_prepass(em, &mb);
+    }
+    /* setjmp rule: names assigned inside a try/catch must be volatile in main */
+    {
+        CmcNode vb; memset(&vb, 0, sizeof(vb));
+        vb.kind = N_BLOCK; vb.stmts = main_body; vb.nstmts = nmain;
+        vol_pass(em, &vb);
+    }
+    e_line(em, "int main(void) {");
+    em->indent++;
+    if (nmain == 0) e_line(em, "(void)0;");
+    for (int i = 0; i < nmain; i++) emit_stmt(em, main_body[i]);
+    em->indent--;
+    e_line(em, "return 0;");
+    e_line(em, "}");
+
+    free(fns); free(classes); free(main_body);
+}
+
 char *cmc_emit(CmcCtx *ctx, CmcNode *program) {
+    /* pass 1 (dry): discovers shape type conflicts and widens fields so that
+     * the real pass already sees the final field types on every read. The
+     * generated text is discarded; only the global shape registry persists. */
+    Emit dry;
+    memset(&dry, 0, sizeof(dry));
+    dry.ctx = ctx;
+    cmc_env_init(&dry.env, ctx->arena);
+    b_init(&dry.out);
+    b_init(&dry.structs);
+    b_init(&dry.pre);
+    b_init(&dry.fn_extra);
+    emit_pass(&dry, ctx, program);
+    free(dry.out.s); free(dry.structs.s); free(dry.pre.s); free(dry.fn_extra.s);
+
+    /* pass 2 (real): the shapes are final; emit the actual program. */
     Emit em;
     memset(&em, 0, sizeof(em));
     em.ctx = ctx;
@@ -12,58 +89,7 @@ char *cmc_emit(CmcCtx *ctx, CmcNode *program) {
     b_init(&em.structs);
     b_init(&em.pre);
     b_init(&em.fn_extra);   /* file-scope helper slot (per-shape dispatch) */
-    cstr_count_pass(&em, program);   /* assignment counts first (invariance) */
-    collect_cstr(&em, program);
-
-    int nfns = 0, nmain = 0, ncls = 0;
-        CmcNode **fns = (CmcNode **)malloc(sizeof(CmcNode *) * (program->nstmts ? program->nstmts : 1));
-        CmcNode **classes = (CmcNode **)malloc(sizeof(CmcNode *) * (program->nstmts ? program->nstmts : 1));
-        CmcNode **main_body = (CmcNode **)malloc(sizeof(CmcNode *) * (program->nstmts ? program->nstmts : 1));
-        for (int i = 0; i < program->nstmts; i++) {
-            CmcNodeKind k = program->stmts[i]->kind;
-            if (k == N_FUNC) fns[nfns++] = program->stmts[i];
-            else if (k == N_CLASS) classes[ncls++] = program->stmts[i];
-            else main_body[nmain++] = program->stmts[i];
-        }
-
-        /* classes first: their methods must exist before any function that uses `new` */
-        for (int i = 0; i < ncls; i++) emit_class(&em, classes[i]);
-
-        /* hoist function symbols so recursion/forward calls resolve */
-    for (int i = 0; i < nfns; i++) {
-        CmcType ret = fn_return_type(fns[i]);
-        if (ret == CT_VOID) ret = CT_INT;
-        CmcSym *s = cmc_env_decl(&em.env, fns[i]->fname, ret, SYM_FUNC);
-        s->cname = fns[i]->fname;
-        s->func_node = fns[i];
-    }
-
-    for (int i = 0; i < nfns; i++) {
-        em.cur_fn = fns[i];
-        emit_function(&em, fns[i]);
-        em.cur_fn = NULL;
-    }
-
-    em.cur_fn = NULL;
-    /* deferred-type pre-pass: `var x;` gets its type from first assignment */
-    {
-        CmcNode mb; memset(&mb, 0, sizeof(mb));
-        mb.kind = N_BLOCK; mb.stmts = main_body; mb.nstmts = nmain;
-        uninit_prepass(&em, &mb);
-    }
-    /* setjmp rule: names assigned inside a try/catch must be volatile in main */
-    {
-        CmcNode vb; memset(&vb, 0, sizeof(vb));
-        vb.kind = N_BLOCK; vb.stmts = main_body; vb.nstmts = nmain;
-        vol_pass(&em, &vb);
-    }
-    e_line(&em, "int main(void) {");
-    em.indent++;
-    if (nmain == 0) e_line(&em, "(void)0;");
-    for (int i = 0; i < nmain; i++) emit_stmt(&em, main_body[i]);
-    em.indent--;
-    e_line(&em, "return 0;");
-    e_line(&em, "}");
+    emit_pass(&em, ctx, program);
 
     Buf out; b_init(&out);
     b_put(&out, "/* generated by cmochicode (JS -> C99) — do not edit by hand */\n");
@@ -88,6 +114,6 @@ char *cmc_emit(CmcCtx *ctx, CmcNode *program) {
     if (em.structs.len) { b_put(&out, em.structs.s); b_put(&out, "\n"); }
     if (em.fn_extra.len) { b_put(&out, em.fn_extra.s); b_put(&out, "\n"); }
     b_put(&out, em.out.s);
-    free(fns); free(main_body);
+    free(em.out.s); free(em.structs.s); free(em.pre.s); free(em.fn_extra.s);
     return out.s;
 }
