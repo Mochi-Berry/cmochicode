@@ -6,9 +6,11 @@
 #
 CC      = gcc
 CFLAGS  = -std=c99 -Wall -Wextra -O2 -I ccompiler -I runtime
-CSRC    = ccompiler/main.c ccompiler/lex.c ccompiler/parse.c ccompiler/ir.c ccompiler/emit.c
+CSRC    = ccompiler/main.c ccompiler/lex.c ccompiler/parse.c ccompiler/ir.c \
+          ccompiler/emit.c ccompiler/emit_helpers.c ccompiler/emit_expr.c \
+          ccompiler/emit_stmt.c ccompiler/emit_class.c
 
-cmochi: $(CSRC) ccompiler/cmochi.h runtime/cmochicode_rt.h
+cmochi: $(CSRC) ccompiler/cmochi.h ccompiler/emit_internal.h runtime/cmochicode_rt.h
 	$(CC) $(CFLAGS) -o cmochi.exe $(CSRC)
 
 # MochiBerry native module (TGPM layout):
@@ -21,7 +23,9 @@ module: $(MODULE)
 $(MODULE): mochi_modules/src/cmochicode.c $(CSRC) mochi_modules/include/cmochicode.h
 	@mkdir -p mochi_modules/lib
 	$(CC) -shared -O2 -o $@ mochi_modules/src/cmochicode.c \
-	    ccompiler/lex.c ccompiler/parse.c ccompiler/ir.c ccompiler/emit.c \
+	    ccompiler/lex.c ccompiler/parse.c ccompiler/ir.c \
+	    ccompiler/emit.c ccompiler/emit_helpers.c ccompiler/emit_expr.c \
+	    ccompiler/emit_stmt.c ccompiler/emit_class.c \
 	    -Iccompiler -Iruntime -Imochi_modules/include -I$(ENGINE_INC) -IE:/sevm/native
 
 # Transpile one example and compile the result to a native binary.
