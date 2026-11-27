@@ -98,12 +98,13 @@ best-effort (no unwinding).
 ## Layout
 
 ```
-ccompiler/   C99 pipeline: cmochi.h, lex.c, parse.c, ir.c, emit.c, main.c
+ccompiler/   C99 pipeline: cmochi.h, lex.c, parse.c, ir.c, emit*.c (5 TU), main.c
 runtime/     cmochicode_rt.h (micro-runtime) + mochi.h/mochi_gc.h (GC wiring)
-native/      cmochicode_module.c — MochiBerry native module source
-mochi_modules/  built cmochicode.dll + test_native.mjs
-examples/    10 verified JS->C examples
-src/         legacy acorn JS->C codegen (reference oracle; not the C99 path)
+node_modules/ TGPM JS face layer: manifest.json, src/index.js, lib/, native/  (tracked, not npm output)
+mochi_modules/ TGPM native layer: lib/ src/ include/ manifest.json script/ CMakeLists.txt
+test/           full-loop module test (test_native.mjs)
+examples/    15 verified JS->C examples
+src/         acorn JS->C oracle, split into src/codegen/ (core/expr/stmt/helpers/index); not the C99 path
 ```
 
 ## Status
