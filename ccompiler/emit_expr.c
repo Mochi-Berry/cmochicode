@@ -1023,10 +1023,19 @@ EStr emit_call(Emit *em, CmcNode *n) {
                                 pt = infer_param_type_lite(em, fn, fn->params[i]->name);
                             emit_cargs_arg(&b, cargs, i, pt);
                         } else if (i < n->nargs) {
-                            if (args[i].type == CT_STR) co_str(em, &b, args[i]);
+                            const char *psh2 = (fn && i < fn->nparams && fn->params[i] && fn->params[i]->kind == N_IDENT)
+                                ? cmc_param_shape(fn->fname, fn->params[i]->name) : NULL;
+                            if (psh2) b_putf(&b, "%s", args[i].code);
+                            else if (args[i].type == CT_STR) co_str(em, &b, args[i]);
                             else co_num(em, &b, args[i]);
                         } else b_put(&b, "0");
                     }
+                }
+                /* record call-site object shapes for polymorphic params */
+                if (fn) for (int i = 0; i < n->nargs && i < fn->nparams; i++) {
+                    if (args[i].type == CT_OBJ && args[i].struct_name &&
+                        fn->params[i] && fn->params[i]->kind == N_IDENT)
+                        cmc_record_param_shape(fn->fname, fn->params[i]->name, args[i].struct_name);
                 }
                 b_put(&b, ")");
                 t = s->type;
@@ -1404,8 +1413,10 @@ void emit_function(Emit *em, CmcNode *fn) {
     if (ret == CT_VOID) ret = CT_INT;
     CmcType *pt = (CmcType *)malloc(sizeof(CmcType) * (fn->nparams ? fn->nparams : 1));
     for (int i = 0; i < fn->nparams; i++) {
-        if (fn->params[i]->kind == N_IDENT) pt[i] = infer_param_type_lite(em, fn, fn->params[i]->name);
-        else pt[i] = CT_DOUBLE;
+        if (fn->params[i]->kind == N_IDENT) {
+            const char *psh = cmc_param_shape(fn->fname, fn->params[i]->name);
+            pt[i] = psh ? CT_OBJ : infer_param_type_lite(em, fn, fn->params[i]->name);
+        } else pt[i] = CT_DOUBLE;
     }
     vol_pass(em, fn->body);
     cmc_env_push(&em->env, em->ctx->arena);
@@ -1417,8 +1428,15 @@ void emit_function(Emit *em, CmcNode *fn) {
             b_putf(&sig, "mochi_array *%s", fn->params[i]->name);
             cmc_env_decl(&em->env, fn->params[i]->name, CT_ARR, SYM_PARAM);
         } else if (fn->params[i]->kind == N_IDENT) {
-            b_putf(&sig, "%s %s", cmc_type_name(pt[i]), fn->params[i]->name);
-            cmc_env_decl(&em->env, fn->params[i]->name, pt[i], SYM_PARAM);
+            const char *psh = cmc_param_shape(fn->fname, fn->params[i]->name);
+            if (psh) {
+                b_putf(&sig, "struct %s * %s", psh, fn->params[i]->name);
+                CmcSym *ps = cmc_env_decl(&em->env, fn->params[i]->name, CT_OBJ, SYM_PARAM);
+                ps->struct_name = psh;
+            } else {
+                b_putf(&sig, "%s %s", cmc_type_name(pt[i]), fn->params[i]->name);
+                cmc_env_decl(&em->env, fn->params[i]->name, pt[i], SYM_PARAM);
+            }
         } else b_put(&sig, "double p");
     }
     b_put(&sig, ") {");

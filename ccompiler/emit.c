@@ -69,6 +69,9 @@ char *cmc_emit(CmcCtx *ctx, CmcNode *program) {
     /* pass 1 (dry): discovers shape type conflicts and widens fields so that
      * the real pass already sees the final field types on every read. The
      * generated text is discarded; only the global shape registry persists. */
+    cmc_param_shapes_reset();
+    /* pass 1 (dry): discovers shape type conflicts, widens fields, and
+     * records call-site shapes for polymorphic object params. */
     Emit dry;
     memset(&dry, 0, sizeof(dry));
     dry.ctx = ctx;
@@ -79,6 +82,18 @@ char *cmc_emit(CmcCtx *ctx, CmcNode *program) {
     b_init(&dry.fn_extra);
     emit_pass(&dry, ctx, program);
     free(dry.out.s); free(dry.structs.s); free(dry.pre.s); free(dry.fn_extra.s);
+    /* pass 1b (dry again): the param shapes from pass 1 let function bodies
+     * record the shapes they pass on (transitive object params). */
+    Emit dry2;
+    memset(&dry2, 0, sizeof(dry2));
+    dry2.ctx = ctx;
+    cmc_env_init(&dry2.env, ctx->arena);
+    b_init(&dry2.out);
+    b_init(&dry2.structs);
+    b_init(&dry2.pre);
+    b_init(&dry2.fn_extra);
+    emit_pass(&dry2, ctx, program);
+    free(dry2.out.s); free(dry2.structs.s); free(dry2.pre.s); free(dry2.fn_extra.s);
 
     /* pass 2 (real): the shapes are final; emit the actual program. */
     Emit em;

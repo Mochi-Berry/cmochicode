@@ -135,9 +135,13 @@ static const char *shape_sig(CmcArena *arena, CmcNode *obj) {
 
 /* Register an object literal; return its struct name. */
 const char *cmc_register_shape(CmcArena *arena, CmcNode *obj) {
+    /* Key shapes per literal INSTANCE (by node identity), not per signature:
+     * two `{a:1}` literals are independent objects, so a dynamic field added
+     * to one (d.x = 5) must not leak into the other as an uninitialized field.
+     * The same AST node is seen in every pass, so the name is stable. */
     const char *sig = shape_sig(arena, obj);
     for (int i = 0; i < g_shapes.n; i++) {
-        if (strcmp(g_shapes.shapes[i].sig, sig) == 0) return g_shapes.shapes[i].name;
+        if (g_shapes.shapes[i].literal == obj) return g_shapes.shapes[i].name;
     }
     if (g_shapes.n == g_shapes.cap) {
         g_shapes.cap = g_shapes.cap ? g_shapes.cap * 2 : 16;
@@ -244,6 +248,32 @@ const char *cmc_shape_field_type(int i, int j) {
 
 /* Merge a dynamically-assigned field into a registered shape (JS allows
  * point.label = "P" on an object literal that only had {x, y}). */
+/* Call-site shape inference for polymorphic object params: a function
+ * parameter that receives an object at a call site gets the object's shape,
+ * so `fill(q)` with q = {v:1} types fill's `q` as `struct <shape> *`. */
+typedef struct { const char *fn; const char *param; const char *sname; } CmcParamShape;
+static CmcParamShape g_param_shapes[64];
+static int g_param_shapes_n = 0;
+void cmc_param_shapes_reset(void) { g_param_shapes_n = 0; }
+void cmc_record_param_shape(const char *fn, const char *param, const char *sname) {
+    if (!fn || !param || !sname) return;
+    for (int i = 0; i < g_param_shapes_n; i++)
+        if (strcmp(g_param_shapes[i].fn, fn) == 0 && strcmp(g_param_shapes[i].param, param) == 0) return;
+    if (g_param_shapes_n < 64) {
+        g_param_shapes[g_param_shapes_n].fn = fn;
+        g_param_shapes[g_param_shapes_n].param = param;
+        g_param_shapes[g_param_shapes_n].sname = sname;
+        g_param_shapes_n++;
+    }
+}
+const char *cmc_param_shape(const char *fn, const char *param) {
+    if (!fn || !param) return NULL;
+    for (int i = 0; i < g_param_shapes_n; i++)
+        if (strcmp(g_param_shapes[i].fn, fn) == 0 && strcmp(g_param_shapes[i].param, param) == 0)
+            return g_param_shapes[i].sname;
+    return NULL;
+}
+
 /* Change an existing field's type (e.g. widen int -> double, or any static
  * type -> CT_MOCHI_VAL when a value of an incompatible type is assigned).
  * The struct definition is emitted AFTER the whole body, so this is visible
