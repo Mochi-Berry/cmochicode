@@ -1776,13 +1776,11 @@ EStr emit_call(Emit *em, CmcNode *n) {
                         } else b_put(&b, "0");
                     }
                 }
-                /* record call-site types so later passes type params from use */
+                /* record call-site object shapes for polymorphic params */
                 if (fn) for (int i = 0; i < n->nargs && i < fn->nparams; i++) {
-                    if (!fn->params[i] || fn->params[i]->kind != N_IDENT) continue;
-                    if (args[i].type == CT_OBJ && args[i].struct_name)
+                    if (args[i].type == CT_OBJ && args[i].struct_name &&
+                        fn->params[i] && fn->params[i]->kind == N_IDENT)
                         cmc_record_param_shape(fn->fname, fn->params[i]->name, args[i].struct_name);
-                    else
-                        cmc_record_param_type(fn->fname, fn->params[i]->name, args[i].type);
                 }
                 b_put(&b, ")");
                 t = s->type;
@@ -2465,8 +2463,7 @@ void emit_function(Emit *em, CmcNode *fn) {
     for (int i = 0; i < fn->nparams; i++) {
         if (fn->params[i]->kind == N_IDENT) {
             const char *psh = cmc_param_shape(fn->fname, fn->params[i]->name);
-            CmcType ct = cmc_param_type(fn->fname, fn->params[i]->name);
-            pt[i] = psh ? CT_OBJ : (ct != CT_UNKNOWN ? ct : infer_param_type_lite(em, fn, fn->params[i]->name));
+            pt[i] = psh ? CT_OBJ : infer_param_type_lite(em, fn, fn->params[i]->name);
         } else pt[i] = CT_DOUBLE;
     }
     vol_pass(em, fn->body);
