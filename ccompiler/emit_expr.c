@@ -33,6 +33,7 @@ EStr emit_ident(Emit *em, CmcNode *n) {
 }
 
 void ensure_dk_helpers(Emit *em, const char *sn);
+const char *fn_return_shape(Emit *em, CmcNode *fn);
 
 EStr emit_member_field(Emit *em, EStr o, CmcNode *obj_node, const char *prop, int optional) {
     if (o.type == CT_ARR && strcmp(prop, "length") == 0) {
@@ -110,6 +111,7 @@ EStr emit_member_field(Emit *em, EStr o, CmcNode *obj_node, const char *prop, in
  * direct struct field access (the fast path); only genuinely runtime keys
  * pay for the dispatch. */
 static char *dk_box(CmcType k, const char *expr) {
+    if (k == CT_MOCHI_VAL) return strdup(expr);  /* already a mochi_val */
     if (k == CT_STR) { Buf b; b_init(&b); b_putf(&b, "mochi_str(%s)", expr); return b.s; }
     if (k == CT_BOOL) { Buf b; b_init(&b); b_putf(&b, "mochi_bool(%s)", expr); return b.s; }
     if (k == CT_ARR) { Buf b; b_init(&b); b_putf(&b, "mochi_arr_box(%s)", expr); return b.s; }
@@ -117,6 +119,7 @@ static char *dk_box(CmcType k, const char *expr) {
     Buf b; b_init(&b); b_putf(&b, "mochi_num(%s)", expr); return b.s;
 }
 static const char *dk_unbox(CmcType k) {
+    if (k == CT_MOCHI_VAL) return "v";   /* keep the tagged value as-is */
     if (k == CT_STR) return "mochi_val_str(v)";
     if (k == CT_BOOL) return "mochi_val_bool(v)";
     if (k == CT_ARR) return "v.p";   /* void* -> mochi_array* (implicit) */
@@ -367,7 +370,45 @@ EStr emit_unary(Emit *em, CmcNode *n) {
         case TK_TILDE: b_putf(&b, "(~(%s))", a.code); return estr(b.s, CT_INT, 0, 0, NULL);
         case TK_MINUS: { Buf c; b_init(&c); co_num(em, &c, a); b_putf(&b, "(-(%s))", c.s); free(c.s); return estr(b.s, a.type == CT_DOUBLE ? CT_DOUBLE : CT_INT, 0, 0, NULL); }
         case TK_PLUS: { Buf c; b_init(&c); co_num(em, &c, a); b_putf(&b, "(+(%s))", c.s); free(c.s); return estr(b.s, CT_DOUBLE, 0, 0, NULL); }
-        case TK_DELETE: b_putf(&b, "(0)"); return estr(b.s, CT_BOOL, 0, 0, NULL);
+        case TK_DELETE: {
+            /* delete obj[k] / obj.key:
+             *  - a runtime key lives in the overflow map -> mochi_map_del
+             *  - a static field cannot vanish from the C struct, so it widens
+             *    to mochi_val and is set to undefined (JS reads undefined) */
+            CmcNode *lhs = n->lhs;
+            if (lhs && lhs->kind == N_MEMBER && lhs->obj) {
+                EStr o = emit_expr(em, lhs->obj);
+                if (o.type == CT_OBJ && o.struct_name) {
+                    const char *sn = o.struct_name;
+                    const char *key = NULL;
+                    if (lhs->computed) key = kfold(em, lhs->prop);
+                    else if (lhs->prop) key = lhs->prop->name;
+                    if (lhs->computed && !key) {
+                        ensure_dk_helpers(em, sn);
+                        EStr idx = emit_expr(em, lhs->prop);
+                        Buf ks; b_init(&ks); co_str(em, &ks, idx);
+                        b_putf(&b, "(mochi_map_del(%s->extra, %s), 1)", o.code, ks.s);
+                        free(ks.s);
+                        return estr(b.s, CT_BOOL, 0, 0, NULL);
+                    }
+                    if (key) {
+                        const char *ft = cmc_struct_field_type(sn, key);
+                        if (!ft) {
+                            ensure_dk_helpers(em, sn);
+                            b_putf(&b, "(mochi_map_del(%s->extra, \"%s\"), 1)", o.code, key);
+                            return estr(b.s, CT_BOOL, 0, 0, NULL);
+                        }
+                        if (strcmp(ft, "mochi_val") != 0)
+                            cmc_shape_widen_field(sn, key, CT_MOCHI_VAL);
+                        b_putf(&b, "(%s->%s = mochi_undef(), 1)", o.code, key);
+                        return estr(b.s, CT_BOOL, 0, 0, NULL);
+                    }
+                }
+                fprintf(stderr, "cmochi: warning: delete on a non-object property is not supported\n");
+            }
+            b_putf(&b, "(1)");
+            return estr(b.s, CT_BOOL, 0, 0, NULL);
+        }
         case TK_VOID: b_putf(&b, "(0)"); return estr(b.s, CT_UNDEF, 0, 0, NULL);
         default: b_put(&b, a.code); return estr(b.s, a.type, a.escapes, a.ptr, NULL);
     }
@@ -669,7 +710,10 @@ EStr emit_object(Emit *em, CmcNode *n) {
         }
         if (pr->key == NULL) continue;
         if (pr->value && (pr->value->kind == N_ARROW || pr->value->kind == N_FUNC)) {
-            /* shorthand method: lift to a static fn, record the inline mapping */
+            /* shorthand method: lift to a static fn, record the inline mapping.
+             * Flush first: the lifted fn must not capture this literal's
+             * pending field assignments. */
+            flush_pre(em);
             EStr fe = emit_expr(em, pr->value);
             if (em->m_n < 64) {
                 em->m_shape[em->m_n] = sn;
@@ -699,6 +743,10 @@ EStr emit_object(Emit *em, CmcNode *n) {
         free(asg.s); free(v.s);
     }
     free(vals);
+    /* The field assignments are pre-lines: flush them HERE so they stay at
+     * the literal's site (a returned literal must not leak its assignments
+     * into the caller). */
+    flush_pre(em);
     return estr(obj, CT_OBJ, 1, 1, sn);
 }
 
@@ -1045,6 +1093,7 @@ EStr emit_call(Emit *em, CmcNode *n) {
         for (int i = 0; i < n->nargs; i++) args[i] = emit_expr(em, n->args[i]);
         Buf b; b_init(&b);
         CmcType t = CT_UNKNOWN;
+        const char *rsh = NULL;   /* shape of the returned object literal */
         if (strcmp(nm, "parseInt") == 0) {
             Buf s; b_init(&s); co_str(em, &s, args[0]);
             b_putf(&b, "(int)atoi(%s)", s.s); free(s.s); t = CT_INT;
@@ -1127,6 +1176,7 @@ EStr emit_call(Emit *em, CmcNode *n) {
                 }
                 b_put(&b, ")");
                 t = s->type;
+                rsh = fn_return_shape(em, fn);
             } else {
                 b_putf(&b, "%s(", nm);
                 for (int i = 0; i < n->nargs; i++) { if (i) b_put(&b, ", "); co_num(em, &b, args[i]); }
@@ -1135,7 +1185,7 @@ EStr emit_call(Emit *em, CmcNode *n) {
             }
         }
         free(args);
-        return estr(b.s, t, 0, t == CT_STR ? 1 : 0, NULL);
+        return estr(b.s, t, 0, t == CT_STR ? 1 : 0, rsh);
     }
     if (callee->kind == N_MEMBER) {
         CmcNode *m = callee;
@@ -1405,6 +1455,31 @@ static int is_str_expr(CmcNode *a) {
         return is_str_expr(a->lhs) || is_str_expr(a->rhs);
     return 0;
 }
+/* The shape of the object literal a function returns. Lets object spread and
+ * polymorphic dispatch know the source's real fields instead of guessing
+ * (a call used to lose the shape, so `{...mk()}` could not copy anything). */
+const char *fn_return_shape(Emit *em, CmcNode *fn) {
+    if (!fn || !fn->body) return NULL;
+    CmcNode *stack[512]; int sp = 0;
+    stack[sp++] = fn->body;
+    while (sp) {
+        CmcNode *cur = stack[--sp];
+        if (!cur) continue;
+        if (cur->kind == N_RETURN && cur->lhs && cur->lhs->kind == N_OBJ)
+            return cmc_register_shape(em->ctx->arena, cur->lhs);
+        if (cur->kind == N_BLOCK) for (int i = 0; i < cur->nstmts; i++) stack[sp++] = cur->stmts[i];
+        else if (cur->kind == N_IF) { stack[sp++] = cur->test; stack[sp++] = cur->cons; stack[sp++] = cur->alt; }
+        else if (cur->kind == N_WHILE || cur->kind == N_DOWHILE || cur->kind == N_FOROF) { stack[sp++] = cur->test; stack[sp++] = cur->stmt; }
+        else if (cur->kind == N_FOR) { stack[sp++] = cur->init; stack[sp++] = cur->test; stack[sp++] = cur->update; stack[sp++] = cur->stmt; }
+        else if (cur->kind == N_VAR) for (int i = 0; i < cur->nstmts; i++) stack[sp++] = cur->stmts[i];
+        else if (cur->kind == N_EXPRSTMT) stack[sp++] = cur->lhs;
+        else if (cur->kind == N_TRY) { stack[sp++] = cur->stmt; stack[sp++] = cur->alt; }
+        else if (cur->kind == N_THROW) stack[sp++] = cur->lhs;
+        else if (cur->kind == N_FUNC || cur->kind == N_CLASS) { /* nested scope */ }
+        else if (cur->lhs) stack[sp++] = cur->lhs;
+    }
+    return NULL;
+}
 CmcType fn_return_type(CmcNode *fn) {
     CmcType ret = CT_VOID;
     int saw = 0;
@@ -1512,6 +1587,7 @@ CmcType infer_param_type_lite(Emit *em, CmcNode *fn, const char *pname) {
 void emit_function(Emit *em, CmcNode *fn) {
     CmcType ret = fn_return_type(fn);
     if (ret == CT_VOID) ret = CT_INT;
+    const char *rshape = (ret == CT_OBJ) ? fn_return_shape(em, fn) : NULL;
     CmcType *pt = (CmcType *)malloc(sizeof(CmcType) * (fn->nparams ? fn->nparams : 1));
     for (int i = 0; i < fn->nparams; i++) {
         if (fn->params[i]->kind == N_IDENT) {
@@ -1522,7 +1598,8 @@ void emit_function(Emit *em, CmcNode *fn) {
     vol_pass(em, fn->body);
     cmc_env_push(&em->env, em->ctx->arena);
     Buf sig; b_init(&sig);
-    b_putf(&sig, "static %s %s(", cmc_type_name(ret), fn->fname);
+    if (rshape) b_putf(&sig, "static struct %s * %s(", rshape, fn->fname);
+    else b_putf(&sig, "static %s %s(", cmc_type_name(ret), fn->fname);
     for (int i = 0; i < fn->nparams; i++) {
         if (i) b_put(&sig, ", ");
         if (fn->params[i]->is_rest && fn->params[i]->kind == N_IDENT) {
