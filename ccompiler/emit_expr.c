@@ -35,6 +35,7 @@ EStr emit_ident(Emit *em, CmcNode *n) {
 void ensure_dk_helpers(Emit *em, const char *sn);
 const char *fn_return_shape(Emit *em, CmcNode *fn);
 void cmc_emit_str_helper(Emit *em, const char *sn);
+void cmc_emit_json_helper(Emit *em, const char *sn);
 
 EStr emit_member_field(Emit *em, EStr o, CmcNode *obj_node, const char *prop, int optional) {
     if (o.type == CT_ARR && strcmp(prop, "length") == 0) {
@@ -178,6 +179,55 @@ void cmc_emit_str_helper(Emit *em, const char *sn) {
         b_put(&g, "    }\n");
     }
     b_put(&g, "    snprintf(buf + off, sizeof buf - off, \" }\");\n");
+    b_put(&g, "    return buf;\n}\n\n");
+    b_put(&em->fn_extra, g.s);
+    free(g.s);
+}
+/* JSON.stringify form for a shape: {"k":v,...} with JSON quoting. Object
+ * fields recurse through their own _json, array fields through
+ * mochi_array_json, and the overflow map entries are included too. */
+void cmc_emit_json_helper(Emit *em, const char *sn) {
+    Buf g; b_init(&g);
+    b_putf(&g, "static const char *%s_json(const struct %s *o) {\n", sn, sn);
+    b_putf(&g, "    static char buf[1024];\n");
+    b_putf(&g, "    int off = 0; int first = 1;\n");
+    b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"{\");\n");
+    for (int f = 0; f < 64; f++) {
+        const char *fn = cmc_struct_field_name_n(sn, f);
+        if (!fn) break;
+        const char *ft = cmc_struct_field_type_n(sn, f);
+        CmcType fk = cmc_struct_field_kind(sn, fn);
+        b_putf(&g, "    if (!first) off += snprintf(buf + off, sizeof buf - off, \",\"); first = 0;\n");
+        b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"\\\"%s\\\":\", \"%s\");\n", fn, fn);
+        if (ft && strncmp(ft, "struct ", 7) == 0) {
+            const char *st = ft + 7;
+            char inner[64]; int ii = 0;
+            while (st[ii] && st[ii] != ' ' && st[ii] != '*' && ii < 63) { inner[ii] = st[ii]; ii++; }
+            inner[ii] = 0;
+            b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%s\", %s_json(o->%s));\n", inner, fn);
+        }
+        else if (ft && strcmp(ft, "mochi_array *") == 0)
+            b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%s\", mochi_array_json(o->%s));\n", fn);
+        else if (ft && strcmp(ft, "const char *") == 0)
+            b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%s\", mochi_val_json(mochi_str(o->%s)));\n", fn);
+        else if (ft && (strcmp(ft, "int") == 0 || strcmp(ft, "int64_t") == 0)) {
+            if (fk == CT_BOOL)
+                b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%s\", o->%s ? \"true\" : \"false\");\n", fn);
+            else
+                b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%lld\", (long long)o->%s);\n", fn);
+        }
+        else if (ft && strcmp(ft, "double") == 0)
+            b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%g\", o->%s);\n", fn);
+        else
+            b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%s\", mochi_val_json(o->%s));\n", fn);
+    }
+    if (cmc_dk_is(sn)) {
+        b_put(&g, "    for (MochiMapEntry *e = o->extra ? o->extra->head : NULL; e; e = e->next) {\n");
+        b_put(&g, "        if (!first) off += snprintf(buf + off, sizeof buf - off, \",\"); first = 0;\n");
+        b_put(&g, "        off += snprintf(buf + off, sizeof buf - off, \"%%s:%%s\", e->key, mochi_val_json(e->val));\n");
+        b_put(&g, "    }\n");
+    }
+    b_put(&g, "    snprintf(buf + off, sizeof buf - off, \"}\");\n");
     b_put(&g, "    return buf;\n}\n\n");
     b_put(&em->fn_extra, g.s);
     free(g.s);
@@ -1209,6 +1259,7 @@ EStr emit_call(Emit *em, CmcNode *n) {
         else if (strcmp(nm, "String") == 0) { co_str(em, &b, args[0]); t = CT_STR; }
         else if (strcmp(nm, "Boolean") == 0) { co_bool(em, &b, args[0]); t = CT_BOOL; }
         else if (strcmp(nm, "isNaN") == 0) { Buf c; b_init(&c); co_num(em, &c, args[0]); b_putf(&b, "isnan(%s)", c.s); free(c.s); t = CT_BOOL; }
+
         else {
             CmcSym *s = cmc_env_lookup(&em->env, nm);
             if (s && s->kind == SYM_FUNC) {
@@ -1296,6 +1347,18 @@ EStr emit_call(Emit *em, CmcNode *n) {
         CmcNode *m = callee;
         EStr o = emit_expr(em, m->obj);
         const char *prop = m->prop ? m->prop->name : "";
+        if (m->obj && m->obj->kind == N_IDENT && m->obj->name &&
+                strcmp(m->obj->name, "JSON") == 0 && strcmp(prop, "stringify") == 0 &&
+                n->nargs == 1) {
+                EStr a = emit_expr(em, n->args[0]);
+                if (a.type == CT_OBJ && a.struct_name) {
+                    Buf jb; b_init(&jb);
+                    b_putf(&jb, "%s_json(%s)", a.struct_name, a.code);
+                    return estr(jb.s, CT_STR, 1, 1, NULL);
+                }
+                fprintf(stderr, "cmochi: warning: JSON.stringify needs an object\n");
+                return estr("\"\"", CT_STR, 1, 1, NULL);
+            }
         /* Object.keys(obj) / Object.values(obj): the shape's runtime key list */
         if (m->obj && m->obj->kind == N_IDENT && m->obj->name &&
             strcmp(m->obj->name, "Object") == 0 && n->nargs >= 1) {

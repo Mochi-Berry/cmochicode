@@ -118,6 +118,23 @@ static inline mochi_val mochi_obj_box(void *o)   { mochi_val x; x.t=5; x.n=0; x.
 static inline double mochi_val_num(mochi_val v)  { return v.t==1 ? atof(v.s) : v.n; }
 /* JS-style value repr: strings get quotes, numbers/bools/null as-is —
  * matches how node prints an object value. */
+/* JSON rendering of a dynamic value: strings are quoted and escaped,
+ * numbers/bools/null bare — what JSON.stringify emits. */
+static inline const char *mochi_val_str(mochi_val v);
+static inline const char *mochi_val_json(mochi_val v){
+    if (v.t==1) {
+        static char sb[4][512]; static int si=0; si=(si+1)&3;
+        int n = snprintf(sb[si], 512, "\"");
+        for (const char *p = v.s; *p && n < 480; p++) {
+            if (*p == '\"' || *p == '\\') n += snprintf(sb[si]+n, 512-n, "\\%c", *p);
+            else if (*p == '\n') n += snprintf(sb[si]+n, 512-n, "\\n");
+            else n += snprintf(sb[si]+n, 512-n, "%c", *p);
+        }
+        snprintf(sb[si]+n, 512-n, "\"");
+        return sb[si];
+    }
+    return mochi_val_str(v);
+}
 static inline const char *mochi_val_str(mochi_val v);
 static inline const char *mochi_val_str_js(mochi_val v){
     if (v.t==1) { static char sb[4][256]; static int si=0; si=(si+1)&3;
@@ -197,6 +214,16 @@ static inline const char *mochi_array_join(mochi_array *a, const char *sep) {
     out[o] = 0; return out;
 }
 /* Node-style inspect: `[ 10, 20, 30 ]` with 'single' quotes for strings. */
+static inline const char *mochi_array_json(mochi_array *a) {
+    static char buf[1024]; int off = 0;
+    off += snprintf(buf+off, sizeof buf - off, "[");
+    if (a) for (int i = 0; i < a->len && off < 900; i++) {
+        if (i) off += snprintf(buf+off, sizeof buf - off, ",");
+        off += snprintf(buf+off, sizeof buf - off, "%s", mochi_val_json(a->items[i]));
+    }
+    snprintf(buf+off, sizeof buf - off, "]");
+    return buf;
+}
 static inline const char *mochi_array_inspect(mochi_array *a) {
     static char b[4][4096]; static int bi = 0; bi = (bi + 1) & 3;
     char *p = b[bi]; int off = 0;

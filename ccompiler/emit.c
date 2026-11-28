@@ -147,6 +147,11 @@ char *cmc_emit(CmcCtx *ctx, CmcNode *program) {
             const char *sn = cmc_shape_name(si);
             if (sn) cmc_emit_str_helper(&em, sn);
         }
+        /* and JSON.stringify formatters */
+        for (int si = 0; si < cmc_shape_count(); si++) {
+            const char *sn = cmc_shape_name(si);
+            if (sn) cmc_emit_json_helper(&em, sn);
+        }
     }
     if (em.fn_extra.len) { b_put(&out, em.fn_extra.s); b_put(&out, "\n"); }
     b_put(&out, em.out.s);
