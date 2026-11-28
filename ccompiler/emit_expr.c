@@ -183,6 +183,30 @@ void ensure_keys_helpers(Emit *em, const char *sn) {
         b_put(&g, "    for (MochiMapEntry *e = o->extra ? o->extra->head : NULL; e; e = e->next)\n"
                   "        mochi_array_push(k, mochi_str(e->key));\n");
     b_put(&g, "    return k;\n}\n\n");
+    /* membership test: `key in obj` */
+    b_putf(&g, "static int %s_has(const struct %s *o, const char *k) {\n", sn, sn);
+    for (int f = 0; f < 64; f++) {
+        const char *fn = cmc_struct_field_name_n(sn, f);
+        if (!fn) break;
+        b_putf(&g, "    if (!strcmp(k, \"%s\")) return 1;\n", fn);
+    }
+    if (cmc_dk_is(sn)) b_put(&g, "    if (o->extra) return mochi_map_has(o->extra, k);\n");
+    b_put(&g, "    return 0;\n}\n\n");
+    /* values in key order: Object.values(obj) */
+    b_putf(&g, "static mochi_array *%s_values(const struct %s *o) {\n", sn, sn);
+    b_put(&g, "    mochi_array *v = mochi_array_new();\n");
+    for (int f = 0; f < 64; f++) {
+        const char *fn = cmc_struct_field_name_n(sn, f);
+        if (!fn) break;
+        Buf rhs; b_init(&rhs); b_putf(&rhs, "o->%s", fn);
+        char *bx = dk_box(cmc_struct_field_kind(sn, fn), rhs.s);
+        b_putf(&g, "    mochi_array_push(v, %s);\n", bx);
+        free(bx); free(rhs.s);
+    }
+    if (cmc_dk_is(sn))
+        b_put(&g, "    for (MochiMapEntry *e = o->extra ? o->extra->head : NULL; e; e = e->next)\n"
+                  "        mochi_array_push(v, e->val);\n");
+    b_put(&g, "    return v;\n}\n\n");
     b_put(&em->fn_extra, g.s);
     free(g.s);
 }
@@ -318,6 +342,20 @@ EStr emit_bin(Emit *em, CmcNode *n) {
                 b_putf(&b, "(%s %s %s)", ln.s, op, rn.s);
                 free(ln.s); free(rn.s);
             }
+            return estr(b.s, CT_BOOL, 0, 0, NULL);
+        }
+        case TK_IN: {
+            /* `key in obj`: runtime membership over the shape's fields and
+             * its overflow map */
+            if (r.type == CT_OBJ && r.struct_name) {
+                ensure_keys_helpers(em, r.struct_name);
+                Buf ks; b_init(&ks); co_str(em, &ks, l);
+                b_putf(&b, "%s_has(%s, %s)", r.struct_name, r.code, ks.s);
+                free(ks.s);
+                return estr(b.s, CT_BOOL, 0, 0, NULL);
+            }
+            fprintf(stderr, "cmochi: warning: the `in` operator needs an object on the right side\n");
+            b_putf(&b, "(0)");
             return estr(b.s, CT_BOOL, 0, 0, NULL);
         }
         case TK_AND: case TK_OR: case TK_XOR:
@@ -1080,6 +1118,46 @@ void emit_cargs_has(Buf *b, const char *cargs, int pos) {
 /* collect field names used in a string context (`"..." + this.f` etc.).
    These fields must be const char * even if their init RHS is a bare param. */
 
+/* Object.assign(tgt, src): a per-shape-pair helper copies src's fields into
+ * tgt (shared fields directly, extra fields via the overflow map), so the
+ * assignment follows JS semantics for both static and dynamic keys. */
+static void emit_assign_helper(Emit *em, const char *ss, const char *ts) {
+    char pair[192]; snprintf(pair, sizeof pair, "%s|%s", ss, ts);
+    for (int i = 0; i < em->asg_n; i++)
+        if (strcmp(em->asg_pairs[i], pair) == 0) return;
+    if (em->asg_n < 64) em->asg_pairs[em->asg_n++] = cmc_arena_strndup(em->ctx->arena, pair, strlen(pair));
+    int tgt_dk = cmc_dk_is(ts);
+    if (tgt_dk) ensure_dk_helpers(em, ts);
+    Buf g; b_init(&g);
+    b_putf(&g, "static void %s_into_%s(struct %s *t, const struct %s *s) {\n", ss, ts, ts, ss);
+    for (int f = 0; f < 64; f++) {
+        const char *fn = cmc_struct_field_name_n(ss, f);
+        if (!fn) break;
+        const char *tft = cmc_struct_field_type(ts, fn);
+        CmcType sk = cmc_struct_field_kind(ss, fn);
+        Buf rhs; b_init(&rhs); b_putf(&rhs, "s->%s", fn);
+        if (tft) {
+            CmcType tk = cmc_struct_field_kind(ts, fn);
+            if (tk == CT_MOCHI_VAL) { char *bx = dk_box(sk, rhs.s); b_putf(&g, "    t->%s = %s;\n", fn, bx); free(bx); }
+            else if (sk == CT_MOCHI_VAL) { b_putf(&g, "    t->%s = %s;\n", fn, dk_unbox(tk)); }
+            else if (tk == CT_STR && sk == CT_STR) b_putf(&g, "    t->%s = s->%s;\n", fn, fn);
+            else if (cmc_is_numeric(tk) && cmc_is_numeric(sk)) b_putf(&g, "    t->%s = (%s)s->%s;\n", fn, cmc_type_name(tk), fn);
+            else if (tk == CT_BOOL) b_putf(&g, "    t->%s = s->%s ? 1 : 0;\n", fn, fn);
+            else b_putf(&g, "    t->%s = s->%s;\n", fn, fn);
+        } else if (tgt_dk) {
+            char *bx = dk_box(sk, rhs.s);
+            b_putf(&g, "    %s_set(t, \"%s\", %s);\n", ts, fn, bx);
+            free(bx);
+        }
+        free(rhs.s);
+    }
+    if (cmc_dk_is(ss) && tgt_dk)
+        b_putf(&g, "    if (s->extra) for (MochiMapEntry *e = s->extra->head; e; e = e->next)\n        %s_set(t, e->key, e->val);\n", ts);
+    b_put(&g, "}\n\n");
+    b_put(&em->fn_extra, g.s);
+    free(g.s);
+}
+
 EStr emit_call(Emit *em, CmcNode *n) {
     CmcNode *callee = n->obj;
     if (n->is_new) return emit_new(em, n); /* `new Ctor(...)` */
@@ -1193,13 +1271,25 @@ EStr emit_call(Emit *em, CmcNode *n) {
         const char *prop = m->prop ? m->prop->name : "";
         /* Object.keys(obj) / Object.values(obj): the shape's runtime key list */
         if (m->obj && m->obj->kind == N_IDENT && m->obj->name &&
-            strcmp(m->obj->name, "Object") == 0 && n->nargs == 1) {
-            if (strcmp(prop, "keys") == 0) {
+            strcmp(m->obj->name, "Object") == 0 && n->nargs >= 1) {
+            if (strcmp(prop, "assign") == 0 && n->nargs == 2) {
+                EStr tgt = emit_expr(em, n->args[0]);
+                EStr src = emit_expr(em, n->args[1]);
+                if (tgt.type == CT_OBJ && src.type == CT_OBJ && tgt.struct_name && src.struct_name) {
+                    emit_assign_helper(em, src.struct_name, tgt.struct_name);
+                    Buf ab; b_init(&ab);
+                    b_putf(&ab, "%s_into_%s(%s, %s)", src.struct_name, tgt.struct_name, tgt.code, src.code);
+                    return estr(ab.s, CT_ARR, 0, 1, NULL);
+                }
+                fprintf(stderr, "cmochi: warning: Object.assign needs two shaped objects\n");
+                return estr("0", CT_UNKNOWN, 0, 0, NULL);
+            }
+            if (strcmp(prop, "keys") == 0 || strcmp(prop, "values") == 0) {
                 EStr a = emit_expr(em, n->args[0]);
                 if (a.struct_name) {
                     ensure_keys_helpers(em, a.struct_name);
                     Buf kb; b_init(&kb);
-                    b_putf(&kb, "%s_keys(%s)", a.struct_name, a.code);
+                    b_putf(&kb, "%s_%s(%s)", a.struct_name, prop, a.code);
                     return estr(kb.s, CT_ARR, 0, 1, NULL);
                 }
             }

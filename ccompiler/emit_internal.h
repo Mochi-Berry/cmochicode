@@ -44,6 +44,7 @@ typedef struct {
     const char *cstr_name[64]; const char *cstr_val[64]; int cstr_count[64]; int cstr_n;
     const char *dk_shapes[64]; int dk_n;   /* shapes with runtime-key get/set helpers */
     const char *keys_shapes[64]; int keys_n;  /* shapes with a _keys helper */
+    const char *asg_pairs[64]; int asg_n;      /* 'src|tgt' Object.assign helpers */
 } Emit;
 
 /* prototypes (all functions share the Emit/Buf/EStr types) */
