@@ -204,6 +204,7 @@ int         cmc_shape_field_count(int i);
 const char *cmc_shape_field_name(int i, int j);
 const char *cmc_shape_field_type(int i, int j);
 void        cmc_shape_add_field(const char *struct_name, const char *field, CmcType t);
+const char *cmc_struct_field_shape(const char *struct_name, const char *field);
 void        cmc_shape_mark_promoted(const char *struct_name, const char *field);
 void        cmc_shape_flush_promotions(void);
 void        cmc_shape_remove_field(const char *struct_name, const char *field);

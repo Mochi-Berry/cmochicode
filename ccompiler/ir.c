@@ -100,6 +100,7 @@ typedef struct {
     CmcNode    *literal;
     const char *field_names[32];
     CmcType     field_types[32];
+    const char *field_shapes[32];   /* inner shape of an object-typed field */
     int         nfields;
 } CmcShape;
 
@@ -171,8 +172,13 @@ const char *cmc_register_shape(CmcArena *arena, CmcNode *obj) {
             else if (v->kind == N_BOOL) t = CT_BOOL;
             else if (v->kind == N_NULL) t = CT_NULL;
             else if (v->kind == N_ARR) t = CT_ARR;
-            else if (v->kind == N_OBJ) t = CT_OBJ;
-            else if (v->kind == N_BIN) {
+            else if (v->kind == N_OBJ) {
+                            t = CT_OBJ;
+                            /* a nested object literal gets its own shape, so the field is
+                               typed `struct X *` and can be printed recursively */
+                            sh->field_shapes[fi] = cmc_register_shape(arena, v);
+                        }
+                        else if (v->kind == N_BIN) {
                 /* string concatenation / template-ish expression */
                 int ls = v->lhs && (v->lhs->kind == N_STR || v->lhs->kind == N_TEMPLATE);
                 int rs = v->rhs && (v->rhs->kind == N_STR || v->rhs->kind == N_TEMPLATE);
@@ -187,12 +193,24 @@ const char *cmc_register_shape(CmcArena *arena, CmcNode *obj) {
 }
 
 const char *cmc_shape_name_for(const char *sig_or_name);
+/* The C type of a field. An object-typed field with a registered inner shape
+ * is typed `struct X *` (not void *), so nested objects keep their shape:
+ * property access on them and recursive printing both work. */
+static const char *field_type_str(const CmcShape *sh, int j) {
+    if (sh->field_shapes[j]) {
+        static char bufs[4][96]; static int bi = 0;
+        bi = (bi + 1) & 3;
+        snprintf(bufs[bi], sizeof bufs[bi], "struct %s *", sh->field_shapes[j]);
+        return bufs[bi];
+    }
+    return cmc_type_name(sh->field_types[j]);
+}
 const char *cmc_struct_field_type(const char *struct_name, const char *field) {
     for (int i = 0; i < g_shapes.n; i++) {
         if (strcmp(g_shapes.shapes[i].name, struct_name) == 0) {
             for (int j = 0; j < g_shapes.shapes[i].nfields; j++) {
                 if (strcmp(g_shapes.shapes[i].field_names[j], field) == 0)
-                    return cmc_type_name(g_shapes.shapes[i].field_types[j]);
+                    return field_type_str(&g_shapes.shapes[i], j);
             }
         }
     }
@@ -227,7 +245,7 @@ const char *cmc_struct_field_type_n(const char *struct_name, int idx) {
     for (int i = 0; i < g_shapes.n; i++) {
         if (strcmp(g_shapes.shapes[i].name, struct_name) == 0) {
             if (idx < 0 || idx >= g_shapes.shapes[i].nfields) return NULL;
-            return cmc_type_name(g_shapes.shapes[i].field_types[idx]);
+            return field_type_str(&g_shapes.shapes[i], idx);
         }
     }
     return NULL;
@@ -243,7 +261,17 @@ const char *cmc_shape_field_name(int i, int j) {
 }
 const char *cmc_shape_field_type(int i, int j) {
     if (i < 0 || i >= g_shapes.n || j < 0 || j >= g_shapes.shapes[i].nfields) return NULL;
-    return cmc_type_name(g_shapes.shapes[i].field_types[j]);
+    return field_type_str(&g_shapes.shapes[i], j);
+}
+/* The inner shape of an object-typed field (NULL for other fields). */
+const char *cmc_struct_field_shape(const char *struct_name, const char *field) {
+    for (int i = 0; i < g_shapes.n; i++) {
+        if (strcmp(g_shapes.shapes[i].name, struct_name) != 0) continue;
+        for (int j = 0; j < g_shapes.shapes[i].nfields; j++)
+            if (strcmp(g_shapes.shapes[i].field_names[j], field) == 0)
+                return g_shapes.shapes[i].field_shapes[j];
+    }
+    return NULL;
 }
 
 /* Merge a dynamically-assigned field into a registered shape (JS allows

@@ -133,6 +133,21 @@ char *cmc_emit(CmcCtx *ctx, CmcNode *program) {
         b_putf(&em.structs, "} %s;\n\n", sn);
     }
     if (em.structs.len) { b_put(&out, em.structs.s); b_put(&out, "\n"); }
+    /* every shape gets a _str formatter (nested objects recurse through it);
+     * forward-declare first so mutually-referencing shapes compile */
+    {
+        Buf decls; b_init(&decls);
+        for (int si = 0; si < cmc_shape_count(); si++) {
+            const char *sn = cmc_shape_name(si);
+            if (sn) b_putf(&decls, "static const char *%s_str(const struct %s *o);\n", sn, sn);
+        }
+        if (decls.len) { b_put(&out, decls.s); b_put(&out, "\n"); }
+        free(decls.s);
+        for (int si = 0; si < cmc_shape_count(); si++) {
+            const char *sn = cmc_shape_name(si);
+            if (sn) cmc_emit_str_helper(&em, sn);
+        }
+    }
     if (em.fn_extra.len) { b_put(&out, em.fn_extra.s); b_put(&out, "\n"); }
     b_put(&out, em.out.s);
     free(em.out.s); free(em.structs.s); free(em.pre.s); free(em.fn_extra.s);

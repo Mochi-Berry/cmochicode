@@ -56,6 +56,7 @@ void b_putf(Buf *b, const char *fmt, ...);
 EStr estr(const char *code, CmcType t, int esc, int ptr, const char *sn);
 void e_line(Emit *em, const char *s);
 void        ensure_keys_helpers(Emit *em, const char *sn);
+void        cmc_emit_str_helper(Emit *em, const char *sn);
 void e_linef(Emit *em, const char *fmt, ...);
 void e_preline(Emit *em, const char *s);
 void flush_pre(Emit *em);

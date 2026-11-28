@@ -185,33 +185,13 @@ void append_print_arg(Emit *em, CmcNode *node, EStr e, Buf *fmt, Buf *fargs) {
         farg_push(fargs, j.s);
         free(j.s);
     }
-    else if (e.type == CT_OBJ && e.struct_name && cmc_dk_is(e.struct_name)) {
-        /* shape with a dynamic overflow map: the generated formatter prints
-           the static fields plus the runtime map entries (JS order) */
+    else if (e.type == CT_OBJ && e.struct_name) {
+        /* every shape has a generated <sn>_str formatter (static fields, then
+         * the overflow map for dk shapes; nested objects/arrays recurse), so
+         * console.log(o) matches node including dynamic keys */
         b_put(fmt, "%s");
         char t[160]; snprintf(t, sizeof t, "%s_str(%s)", e.struct_name, e.code);
         farg_push(fargs, t);
-    }
-    else if (e.type == CT_OBJ && e.struct_name) {
-        b_put(fmt, "{ ");
-        int first = 1;
-        for (int f = 0; f < 64; f++) {
-            const char *fn = cmc_struct_field_name_n(e.struct_name, f);
-            if (!fn) break;
-            const char *ft = cmc_struct_field_type_n(e.struct_name, f);
-            if (!first) b_put(fmt, ", ");
-            first = 0;
-            b_putf(fmt, "%s: ", fn);
-            if (strcmp(ft, "const char *") == 0) { b_put(fmt, "'%s'"); char t[128]; snprintf(t, sizeof t, "%s->%s", e.code, fn); farg_push(fargs, t); }
-            else if (strcmp(ft, "int") == 0 || strcmp(ft, "int64_t") == 0) {
-                if (cmc_struct_field_kind(e.struct_name, fn) == CT_BOOL) {
-                    b_put(fmt, "%s"); char t[128]; snprintf(t, sizeof t, "(%s->%s ? \"true\" : \"false\")", e.code, fn); farg_push(fargs, t);
-                } else { b_put(fmt, "%lld"); char t[128]; snprintf(t, sizeof t, "(long long)%s->%s", e.code, fn); farg_push(fargs, t); }
-            }
-            else if (strcmp(ft, "double") == 0) { b_put(fmt, "%g"); char t[128]; snprintf(t, sizeof t, "%s->%s", e.code, fn); farg_push(fargs, t); }
-            else { b_put(fmt, "%s"); char t[128]; snprintf(t, sizeof t, "mochi_val_str(%s->%s)", e.code, fn); farg_push(fargs, t); }
-        }
-        b_put(fmt, " }");
     }
     else { b_put(fmt, "%s"); Buf s; b_init(&s); co_str(em, &s, e); farg_push(fargs, s.s); free(s.s); }
 }

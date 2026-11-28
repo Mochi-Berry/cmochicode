@@ -34,6 +34,7 @@ EStr emit_ident(Emit *em, CmcNode *n) {
 
 void ensure_dk_helpers(Emit *em, const char *sn);
 const char *fn_return_shape(Emit *em, CmcNode *fn);
+void cmc_emit_str_helper(Emit *em, const char *sn);
 
 EStr emit_member_field(Emit *em, EStr o, CmcNode *obj_node, const char *prop, int optional) {
     if (o.type == CT_ARR && strcmp(prop, "length") == 0) {
@@ -84,7 +85,10 @@ EStr emit_member_field(Emit *em, EStr o, CmcNode *obj_node, const char *prop, in
         else if (strcmp(ft, "const char *") == 0) t = CT_STR;
         else if (strcmp(ft, "mochi_array *") == 0) t = CT_ARR;
         else if (strcmp(ft, "mochi_val") == 0) t = CT_MOCHI_VAL;
+        else if (strncmp(ft, "struct ", 7) == 0) t = CT_OBJ;
         else t = CT_UNKNOWN;
+        const char *inner_sn = (t == CT_OBJ && o.struct_name)
+            ? cmc_struct_field_shape(o.struct_name, prop) : NULL;
         /* optional chaining `user?.id`: yield 0/NULL instead of crashing */
         if (optional) {
             Buf w; b_init(&w);
@@ -92,9 +96,10 @@ EStr emit_member_field(Emit *em, EStr o, CmcNode *obj_node, const char *prop, in
             else if (t == CT_ARR) b_putf(&w, "(%s != NULL ? %s : NULL)", o.code, b.s);
             else b_putf(&w, "(%s != NULL ? %s : 0)", o.code, b.s);
             free(b.s);
-            return estr(w.s, t, 0, t == CT_STR || t == CT_ARR ? 1 : 0, NULL);
+            return estr(w.s, t, 0, t == CT_STR || t == CT_ARR ? 1 : 0, inner_sn);
         }
-        return estr(b.s, t, 0, 0, NULL);
+        /* object/array fields hold POINTERS: member_base must use `->` */
+        return estr(b.s, t, 0, (t == CT_OBJ || t == CT_ARR) ? 1 : 0, inner_sn);
     }
     Buf b; b_init(&b);
     member_base(em, &b, o);
@@ -126,9 +131,10 @@ static const char *dk_unbox(CmcType k) {
     if (k == CT_OBJ) return "v.p";   /* void* -> struct X* (implicit) */
     return "mochi_val_num(v)";
 }
-/* A string formatter for a shape with a dynamic overflow map: the static
- * fields first, then the runtime map entries, so console.log(o) matches JS. */
-static void emit_dk_str_helper(Emit *em, const char *sn) {
+/* A string formatter for a shape: the static fields first, then (for dk
+ * shapes) the runtime map entries, so console.log(o) matches node. Object and
+ * array fields print recursively (their own _str / mochi_array_inspect). */
+void cmc_emit_str_helper(Emit *em, const char *sn) {
     Buf g; b_init(&g);
     b_putf(&g, "static const char *%s_str(const struct %s *o) {\n", sn, sn);
     b_putf(&g, "    static char buf[512];\n");
@@ -138,25 +144,39 @@ static void emit_dk_str_helper(Emit *em, const char *sn) {
         const char *fn = cmc_struct_field_name_n(sn, f);
         if (!fn) break;
         const char *ft = cmc_struct_field_type_n(sn, f);
+        CmcType fk = cmc_struct_field_kind(sn, fn);
         b_putf(&g, "    if (!first) off += snprintf(buf + off, sizeof buf - off, \", \"); first = 0;\n");
         b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%s: \");\n", fn);
-        if (strcmp(ft, "const char *") == 0)
+        /* dispatch on the C type string first: a nested object field's KIND
+         * may be unknown even though its type is `struct X *` */
+        if (ft && strncmp(ft, "struct ", 7) == 0) {
+            const char *st = ft + 7;
+            char inner[64]; int ii = 0;
+            while (st[ii] && st[ii] != ' ' && st[ii] != '*' && ii < 63) { inner[ii] = st[ii]; ii++; }
+            inner[ii] = 0;
+            b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%s\", %s_str(o->%s));\n", inner, fn);
+        }
+        else if (ft && strcmp(ft, "mochi_array *") == 0)
+            b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%s\", mochi_array_inspect(o->%s));\n", fn);
+        else if (ft && strcmp(ft, "const char *") == 0)
             b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"'%%s'\", o->%s);\n", fn);
-        else if (strcmp(ft, "int") == 0 || strcmp(ft, "int64_t") == 0) {
-            if (cmc_struct_field_kind(sn, fn) == CT_BOOL)
+        else if (ft && (strcmp(ft, "int") == 0 || strcmp(ft, "int64_t") == 0)) {
+            if (fk == CT_BOOL)
                 b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%s\", o->%s ? \"true\" : \"false\");\n", fn);
             else
                 b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%lld\", (long long)o->%s);\n", fn);
         }
-        else if (strcmp(ft, "double") == 0)
+        else if (ft && strcmp(ft, "double") == 0)
             b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%g\", o->%s);\n", fn);
         else
-            b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%s\", mochi_val_str(o->%s));\n", fn);
+            b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%s\", mochi_val_str_js(o->%s));\n", fn);
     }
-    b_put(&g, "    for (MochiMapEntry *e = o->extra ? o->extra->head : NULL; e; e = e->next) {\n");
-    b_put(&g, "        if (!first) off += snprintf(buf + off, sizeof buf - off, \", \"); first = 0;\n");
-    b_put(&g, "        off += snprintf(buf + off, sizeof buf - off, \"%s: %s\", e->key, mochi_val_str_js(e->val));\n");
-    b_put(&g, "    }\n");
+    if (cmc_dk_is(sn)) {
+        b_put(&g, "    for (MochiMapEntry *e = o->extra ? o->extra->head : NULL; e; e = e->next) {\n");
+        b_put(&g, "        if (!first) off += snprintf(buf + off, sizeof buf - off, \", \"); first = 0;\n");
+        b_put(&g, "        off += snprintf(buf + off, sizeof buf - off, \"%s: %s\", e->key, mochi_val_str_js(e->val));\n");
+        b_put(&g, "    }\n");
+    }
     b_put(&g, "    snprintf(buf + off, sizeof buf - off, \" }\");\n");
     b_put(&g, "    return buf;\n}\n\n");
     b_put(&em->fn_extra, g.s);
@@ -239,7 +259,6 @@ void ensure_dk_helpers(Emit *em, const char *sn) {
     b_put(&g, "    mochi_map_set(o->extra, k, v);\n}\n\n");
     b_put(&em->fn_extra, g.s);
     free(g.s);
-    emit_dk_str_helper(em, sn);
 }
 
 EStr emit_member(Emit *em, CmcNode *n) {
@@ -295,6 +314,14 @@ EStr emit_bin(Emit *em, CmcNode *n) {
             }
             Buf ln, rn; b_init(&ln); b_init(&rn);
             co_num(em, &ln, l); co_num(em, &rn, r);
+            /* a mochi_val operand is unboxed to a double at runtime, so the
+             * result is a double too (printing it with %d reads the varargs
+             * as an int -> garbage) */
+            if (l.type == CT_MOCHI_VAL || r.type == CT_MOCHI_VAL) {
+                b_putf(&b, "(%s + %s)", ln.s, rn.s);
+                free(ln.s); free(rn.s);
+                return estr(b.s, CT_DOUBLE, 0, 0, NULL);
+            }
             b_putf(&b, "(%s + %s)", ln.s, rn.s);
             free(ln.s); free(rn.s);
             CmcType t = (l.type == CT_DOUBLE || r.type == CT_DOUBLE) ? CT_DOUBLE :
