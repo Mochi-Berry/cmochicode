@@ -352,22 +352,13 @@ void emit_forin(Emit *em, CmcNode *n) {
     const char *sname = obj.struct_name;
     if (!sname) { e_line(em, "(void)0;"); return; }
     cmc_env_decl(&em->env, n->left->name, CT_STR, SYM_LOCAL);
-    const char *keys = tmp_name(em, "keys");
+    const char *kl = tmp_name(em, "kl");
     const char *ki = tmp_name(em, "ki");
-    int nf = 0;
-    e_linef(em, "const char *%s[] = {", keys);
-    for (int f = 0; f < 64; f++) {
-        const char *fn = cmc_struct_field_name_n(sname, f);
-        if (!fn) break;
-        if (nf) e_line(em, ", ");
-        e_linef(em, "\"%s\"", fn);
-        nf++;
-    }
-    e_line(em, "};");
-    if (nf == 0) return;
-    e_linef(em, "for (size_t %s = 0; %s < %d; %s++) {", ki, ki, nf, ki);
+    ensure_keys_helpers(em, sname);
+    e_linef(em, "mochi_array *%s = %s_keys(%s);", kl, sname, obj.code);
+    e_linef(em, "for (size_t %s = 0; %s < (%s)->len; %s++) {", ki, ki, kl, ki);
     em->indent++;
-    e_linef(em, "const char *%s = %s[%s];", n->left->name, keys, ki);
+    e_linef(em, "const char *%s = mochi_val_str(mochi_array_get(%s, %s));", n->left->name, kl, ki);
     emit_stmt(em, n->stmt);
     em->indent--;
     e_line(em, "}");

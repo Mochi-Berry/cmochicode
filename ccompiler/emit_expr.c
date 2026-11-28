@@ -159,6 +159,30 @@ static void emit_dk_str_helper(Emit *em, const char *sn) {
     b_put(&em->fn_extra, g.s);
     free(g.s);
 }
+/* Runtime key list for a shape: the static field names, then the overflow
+ * map keys — exactly JS enumeration order. Powers for-in over an object and
+ * Object.keys(obj); the static-field-only list the old for-in used missed
+ * every runtime key. */
+void ensure_keys_helpers(Emit *em, const char *sn) {
+    if (!sn) return;
+    for (int i = 0; i < em->keys_n; i++)
+        if (strcmp(em->keys_shapes[i], sn) == 0) return;
+    if (em->keys_n < 64) em->keys_shapes[em->keys_n++] = sn;
+    Buf g; b_init(&g);
+    b_putf(&g, "static mochi_array *%s_keys(const struct %s *o) {\n", sn, sn);
+    b_putf(&g, "    mochi_array *k = mochi_array_new();\n");
+    for (int f = 0; f < 64; f++) {
+        const char *fn = cmc_struct_field_name_n(sn, f);
+        if (!fn) break;
+        b_putf(&g, "    mochi_array_push(k, mochi_str(\"%s\"));\n", fn);
+    }
+    if (cmc_dk_is(sn))
+        b_put(&g, "    for (MochiMapEntry *e = o->extra ? o->extra->head : NULL; e; e = e->next)\n"
+                  "        mochi_array_push(k, mochi_str(e->key));\n");
+    b_put(&g, "    return k;\n}\n\n");
+    b_put(&em->fn_extra, g.s);
+    free(g.s);
+}
 void ensure_dk_helpers(Emit *em, const char *sn) {
     if (!sn) return;
     for (int i = 0; i < em->dk_n; i++)
@@ -1117,6 +1141,19 @@ EStr emit_call(Emit *em, CmcNode *n) {
         CmcNode *m = callee;
         EStr o = emit_expr(em, m->obj);
         const char *prop = m->prop ? m->prop->name : "";
+        /* Object.keys(obj) / Object.values(obj): the shape's runtime key list */
+        if (m->obj && m->obj->kind == N_IDENT && m->obj->name &&
+            strcmp(m->obj->name, "Object") == 0 && n->nargs == 1) {
+            if (strcmp(prop, "keys") == 0) {
+                EStr a = emit_expr(em, n->args[0]);
+                if (a.struct_name) {
+                    ensure_keys_helpers(em, a.struct_name);
+                    Buf kb; b_init(&kb);
+                    b_putf(&kb, "%s_keys(%s)", a.struct_name, a.code);
+                    return estr(kb.s, CT_ARR, 0, 1, NULL);
+                }
+            }
+        }
         /* object shorthand method call: inline the lifted static fn */
         if (o.struct_name) {
             for (int mi = 0; mi < em->m_n; mi++) {

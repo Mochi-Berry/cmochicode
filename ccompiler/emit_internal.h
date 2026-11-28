@@ -43,6 +43,7 @@ typedef struct {
     int         cl_n;
     const char *cstr_name[64]; const char *cstr_val[64]; int cstr_count[64]; int cstr_n;
     const char *dk_shapes[64]; int dk_n;   /* shapes with runtime-key get/set helpers */
+    const char *keys_shapes[64]; int keys_n;  /* shapes with a _keys helper */
 } Emit;
 
 /* prototypes (all functions share the Emit/Buf/EStr types) */
@@ -53,6 +54,7 @@ void b_putn(Buf *b, const char *s, size_t n);
 void b_putf(Buf *b, const char *fmt, ...);
 EStr estr(const char *code, CmcType t, int esc, int ptr, const char *sn);
 void e_line(Emit *em, const char *s);
+void        ensure_keys_helpers(Emit *em, const char *sn);
 void e_linef(Emit *em, const char *fmt, ...);
 void e_preline(Emit *em, const char *s);
 void flush_pre(Emit *em);
