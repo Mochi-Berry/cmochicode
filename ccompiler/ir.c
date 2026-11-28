@@ -468,6 +468,8 @@ CmcType cmc_type_of(CmcCtx *ctx, CmcEnv *env, CmcNode *n) {
                 if (strcmp(nm, "Boolean") == 0) return CT_BOOL;
                 CmcSym *s = cmc_env_lookup(env, nm);
                 if (s && s->kind == SYM_FUNC) return s->type;
+                /* a variable/param used as a callee is a boxed callable */
+                if (s && (s->kind == SYM_LOCAL || s->kind == SYM_PARAM)) return CT_MOCHI_VAL;
                 return CT_UNKNOWN;
             }
             if (callee->kind == N_MEMBER) {

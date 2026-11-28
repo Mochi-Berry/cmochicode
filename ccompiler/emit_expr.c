@@ -24,8 +24,26 @@ EStr emit_literal(Emit *em, CmcNode *n) {
 }
 
 EStr emit_ident(Emit *em, CmcNode *n) {
+    /* a name captured from an enclosing function: read through the upvalue */
+    if (em->cur_up && em->cur_ncapt > 0) {
+        for (int i = 0; i < em->cur_ncapt; i++) {
+            if (em->cur_capt[i] && !strcmp(em->cur_capt[i], n->name)) {
+                char cb[128];
+                snprintf(cb, sizeof cb, "((struct %s *)__env)->%s", em->cur_up, n->name);
+                return estr(cmc_arena_strndup(em->ctx->arena, cb, strlen(cb)),
+                            em->cur_capt_type[i], 0, 0, NULL);
+            }
+        }
+    }
     CmcSym *s = cmc_env_lookup(&em->env, n->name);
     if (s) {
+        if (s->kind == SYM_FUNC) {
+            /* a function used as a value: box it into a callable (t=5) */
+            char buf[128];
+            snprintf(buf, sizeof buf, "mochi_fn_box_n(__shim_%s, NULL, \"%s\")", s->cname, n->name);
+            const char *box = cmc_arena_strndup(em->ctx->arena, buf, strlen(buf));
+            return estr(box, CT_MOCHI_VAL, 0, 0, NULL);
+        }
         int ptr = s->heap || s->type == CT_STR || s->type == CT_OBJ || s->type == CT_ARR;
         return estr(s->cname, s->type, s->heap, ptr, s->struct_name);
     }
@@ -37,7 +55,25 @@ const char *fn_return_shape(Emit *em, CmcNode *fn);
 void cmc_emit_str_helper(Emit *em, const char *sn);
 void cmc_emit_json_helper(Emit *em, const char *sn);
 
+static const char *capt_lvalue(Emit *em, const char *name);
 EStr emit_member_field(Emit *em, EStr o, CmcNode *obj_node, const char *prop, int optional) {
+    /* function.length: params before the first default / rest — must be
+     * checked FIRST, because a function name used as a value is now boxed
+     * to CT_MOCHI_VAL (the callable), which would otherwise take the generic
+     * dynamic-length path and return 0. */
+    if (strcmp(prop, "length") == 0 && obj_node && obj_node->kind == N_IDENT) {
+        CmcSym *s = cmc_env_lookup(&em->env, obj_node->name);
+        if (s && s->kind == SYM_FUNC && s->func_node) {
+            int cnt = 0;
+            for (int i = 0; i < s->func_node->nparams; i++) {
+                CmcNode *pn = s->func_node->params[i];
+                if (pn->is_rest || pn->kind == N_ASSIGN) break;
+                cnt++;
+            }
+            char nb[32]; snprintf(nb, sizeof nb, "%d", cnt);
+            return estr(cmc_arena_strndup(em->ctx->arena, nb, strlen(nb)), CT_INT, 0, 0, NULL);
+        }
+    }
     if (o.type == CT_ARR && strcmp(prop, "length") == 0) {
         Buf b; b_init(&b);
         b_putf(&b, "(int)(%s%slen)", o.code, o.ptr ? "->" : ".");
@@ -53,20 +89,6 @@ EStr emit_member_field(Emit *em, EStr o, CmcNode *obj_node, const char *prop, in
             Buf b; b_init(&b);
             b_putf(&b, "mochi_val_length(%s)", o.code);
             return estr(b.s, CT_INT, 0, 0, NULL);
-        }
-        /* function.length: params before the first default / rest */
-        if (strcmp(prop, "length") == 0 && obj_node && obj_node->kind == N_IDENT) {
-            CmcSym *s = cmc_env_lookup(&em->env, obj_node->name);
-            if (s && s->kind == SYM_FUNC && s->func_node) {
-                int cnt = 0;
-                for (int i = 0; i < s->func_node->nparams; i++) {
-                    CmcNode *pn = s->func_node->params[i];
-                    if (pn->is_rest || pn->kind == N_ASSIGN) break;
-                    cnt++;
-                }
-                char nb[32]; snprintf(nb, sizeof nb, "%d", cnt);
-                return estr(cmc_arena_strndup(em->ctx->arena, nb, strlen(nb)), CT_INT, 0, 0, NULL);
-            }
         }
     if (o.type == CT_OBJ) {
         /* Unknown static key: dispatch via the shape's get helper so the
@@ -624,6 +646,33 @@ EStr emit_assign(Emit *em, CmcNode *n) {
     EStr r = emit_expr(em, n->rhs);
     Buf b; b_init(&b);
     if (n->lhs->kind == N_IDENT) {
+        const char *cap = capt_lvalue(em, n->lhs->name);
+        if (cap) {
+            char cb2[128];
+            snprintf(cb2, sizeof cb2, "((struct %s *)__env)->%s", cap, n->lhs->name);
+            if (n->op == TK_EQ) {
+                b_putf(&b, "%s = ", cb2);
+                CmcType ct = CT_UNKNOWN;
+                for (int i = 0; i < em->cur_ncapt; i++)
+                    if (!strcmp(em->cur_capt[i], n->lhs->name)) ct = em->cur_capt_type[i];
+                Buf rv; b_init(&rv);
+                if (ct == CT_STR) co_str(em, &rv, r);
+                else if (cmc_is_numeric(ct)) co_num(em, &rv, r);
+                else b_put(&rv, r.code);
+                b_put(&b, rv.s);
+                free(rv.s);
+            } else {
+                b_putf(&b, "%s = %s", cb2, cb2);
+                Buf rv; b_init(&rv);
+                if (cmc_is_numeric(r.type)) co_num(em, &rv, r); else b_put(&rv, r.code);
+                b_putf(&b, " + %s", rv.s);
+                free(rv.s);
+            }
+            CmcType ct2 = CT_UNKNOWN;
+            for (int i = 0; i < em->cur_ncapt; i++)
+                if (!strcmp(em->cur_capt[i], n->lhs->name)) ct2 = em->cur_capt_type[i];
+            return estr(b.s, ct2 == CT_UNKNOWN ? CT_DOUBLE : ct2, 0, 0, NULL);
+        }
         CmcSym *s = cmc_env_lookup(&em->env, n->lhs->name);
         const char *target = s ? s->cname : n->lhs->name;
         CmcType t = s ? s->type : r.type;
@@ -705,6 +754,13 @@ EStr emit_update(Emit *em, CmcNode *n) {
     EStr a = emit_expr(em, n->lhs);
     Buf b; b_init(&b);
     if (n->lhs->kind == N_IDENT) {
+        const char *capu = capt_lvalue(em, n->lhs->name);
+        if (capu) {
+            char cb3[128];
+            snprintf(cb3, sizeof cb3, "((struct %s *)__env)->%s", capu, n->lhs->name);
+            b_putf(&b, "(%s %s= 1)", cb3, n->op > 0 ? "+" : "-");
+            return estr(b.s, CT_INT, 0, 0, NULL);
+        }
         CmcSym *s = cmc_env_lookup(&em->env, n->lhs->name);
         const char *target = s ? s->cname : n->lhs->name;
         int prefix = (n->third != NULL);
@@ -853,10 +909,27 @@ EStr emit_object(Emit *em, CmcNode *n) {
              * pending field assignments. */
             flush_pre(em);
             EStr fe = emit_expr(em, pr->value);
+            /* emit_arrow returns a box expression `mochi_fn_box_n(__shim_FN,
+             * NULL, "FN")` — extract FN so call sites invoke the C function
+             * directly rather than calling the box value. */
+            const char *feC = fe.code;
+            {
+                const char *sh = strstr(fe.code, "__shim_");
+                if (sh) {
+                    sh += 7;
+                    const char *q = strchr(sh, ',');
+                    if (q) {
+                        size_t fl = (size_t)(q - sh);
+                        char *fnn = (char *)malloc(fl + 1);
+                        memcpy(fnn, sh, fl); fnn[fl] = 0;
+                        feC = fnn;
+                    }
+                }
+            }
             if (em->m_n < 64) {
                 em->m_shape[em->m_n] = sn;
                 em->m_field[em->m_n] = pr->key;
-                em->m_fn[em->m_n] = fe.code;
+                em->m_fn[em->m_n] = feC;
                 em->m_node[em->m_n] = pr->value;
                 em->m_guarded[em->m_n] = 1; /* arrow lifted w/ has_X guards */
                 em->m_nparams[em->m_n] = pr->value->nparams;
@@ -913,9 +986,109 @@ EStr emit_template(Emit *em, CmcNode *n) {
 }
 
 EStr emit_arrow(Emit *em, CmcNode *n);
+
+/* ---------- closure capture ----------
+ * A nested arrow that references a name declared in an enclosing function
+ * (a param or a local, NOT a global) must capture it. We use snapshot
+ * semantics: the value is copied into a heap env struct when the function
+ * value is created, and the arrow reads/writes its own copy through env.
+ * (JS captures by reference; snapshot is a documented approximation that
+ * matches `let`-style iteration capture.) */
+typedef struct { const char *name; CmcType type; const char *sn; } CmcFreeVar;
+static void fv_walk(CmcNode *nd, CmcFreeVar *out, int *cnt);
+static int fv_is_param(CmcNode *n, const char *name);
+static int fv_is_declared(CmcNode *body, const char *name);
+
+int arrow_captures(Emit *em, CmcNode *arrow) {
+    if (!arrow || (arrow->kind != N_ARROW && arrow->kind != N_FUNC)) return 0;
+    CmcFreeVar fv[16]; int nfv = 0;
+    fv_walk(arrow->body, fv, &nfv);
+    for (int i = 0; i < nfv; i++) {
+        if (fv_is_param(arrow, fv[i].name)) continue;
+        if (fv_is_declared(arrow->body, fv[i].name)) continue;
+        CmcSym *cs = cmc_env_lookup(&em->env, fv[i].name);
+        if (cs && cs->kind != SYM_FUNC && cs->kind != SYM_GLOBAL) return 1;
+    }
+    return 0;
+}
+
+static void fv_walk(CmcNode *nd, CmcFreeVar *out, int *cnt) {
+    if (!nd || *cnt >= 16) return;
+    switch (nd->kind) {
+        case N_IDENT:
+            if (nd->name) { out[*cnt].name = nd->name; out[*cnt].type = CT_UNKNOWN; out[*cnt].sn = NULL; (*cnt)++; }
+            return;
+        case N_MEMBER: fv_walk(nd->obj, out, cnt); if (!nd->computed) { } else fv_walk(nd->prop, out, cnt); return;
+        case N_CALL: fv_walk(nd->obj, out, cnt); for (int i = 0; i < nd->nargs; i++) fv_walk(nd->args[i], out, cnt); return;
+        case N_BIN: case N_ASSIGN: case N_NULLISH:
+            fv_walk(nd->lhs, out, cnt); fv_walk(nd->rhs, out, cnt); return;
+        case N_UNARY: case N_UPDATE: case N_THROW: fv_walk(nd->lhs, out, cnt); return;
+        case N_COND: fv_walk(nd->cons, out, cnt); fv_walk(nd->alt, out, cnt); fv_walk(nd->third, out, cnt); return;
+        case N_ARR: for (int i = 0; i < nd->nelems; i++) fv_walk(nd->elems[i], out, cnt); return;
+        case N_OBJ: for (int i = 0; i < nd->nprops; i++) { if (nd->props[i].value) fv_walk(nd->props[i].value, out, cnt); } return;
+        case N_TEMPLATE: for (int i = 0; i < nd->nexprs; i++) fv_walk(nd->exprs[i], out, cnt); return;
+        case N_SEQ: for (int i = 0; i < nd->nstmts; i++) fv_walk(nd->stmts[i], out, cnt); return;
+        case N_RETURN: fv_walk(nd->lhs, out, cnt); return;
+        case N_IF: fv_walk(nd->cons, out, cnt); fv_walk(nd->alt, out, cnt); return;
+        case N_WHILE: fv_walk(nd->test, out, cnt); fv_walk(nd->stmt, out, cnt); return;
+        case N_FOR: fv_walk(nd->init, out, cnt); fv_walk(nd->test, out, cnt); fv_walk(nd->update, out, cnt); fv_walk(nd->stmt, out, cnt); return;
+        case N_FOROF: case N_FORIN: fv_walk(nd->left, out, cnt); fv_walk(nd->obj, out, cnt); fv_walk(nd->stmt, out, cnt); return;
+        case N_BLOCK: for (int i = 0; i < nd->nstmts; i++) fv_walk(nd->stmts[i], out, cnt); return;
+        case N_VAR: for (int i = 0; i < nd->nstmts; i++) fv_walk(nd->stmts[i], out, cnt); return;
+        case N_EXPRSTMT: fv_walk(nd->lhs, out, cnt); return;
+        case N_ARROW: case N_FUNC:
+            /* descend: a nested closure's free vars that resolve to THIS
+             * function's scope must be captured transitively. */
+            fv_walk(nd->body, out, cnt); return;
+        case N_CLASS: return; /* methods have their own this/scope */
+        default: return;
+    }
+}
+static int fv_is_param(CmcNode *n, const char *name) {
+    for (int i = 0; i < n->nparams; i++) {
+        const char *pn = n->params[i]->name;
+        if (pn && !strcmp(pn, name)) return 1;
+    }
+    return 0;
+}
+static int fv_is_declared(CmcNode *body, const char *name) {
+    /* var/let/const declared directly in the arrow body */
+    if (!body) return 0;
+    if (body->kind == N_BLOCK) {
+        for (int i = 0; i < body->nstmts; i++) {
+            CmcNode *st = body->stmts[i];
+            if (st->kind == N_VAR)
+                for (int j = 0; j < st->nstmts; j++) {
+                    const char *vn = st->stmts[j]->name;
+                    if (vn && !strcmp(vn, name)) return 1;
+                }
+        }
+    } else if (body->kind == N_VAR) {
+        for (int j = 0; j < body->nstmts; j++) {
+            const char *vn = body->stmts[j]->name;
+            if (vn && !strcmp(vn, name)) return 1;
+        }
+    }
+    return 0;
+}
+EStr emit_stored_fn_call(Emit *em, CmcNode *n, EStr o);
 EStr emit_call(Emit *em, CmcNode *n);
 
+/* a captured name read/written as an lvalue inside the arrow body */
+static const char *capt_lvalue(Emit *em, const char *name) {
+    if (!em->cur_up || em->cur_ncapt <= 0 || !name) return NULL;
+    for (int i = 0; i < em->cur_ncapt; i++)
+        if (em->cur_capt[i] && !strcmp(em->cur_capt[i], name)) return em->cur_up;
+    return NULL;
+}
+
 EStr emit_arrow(Emit *em, CmcNode *n) {
+    /* the enclosing function's capture set: a name it captured must be read
+     * through ITS env at this boxing site (nested closures). */
+    const char *enc_up = em->cur_up;
+    const char *enc_capt[16];
+    for (int i = 0; i < em->cur_ncapt && i < 16; i++) enc_capt[i] = em->cur_capt[i];
+    int enc_ncap = em->cur_ncapt;
     char fnbuf[64];
     snprintf(fnbuf, sizeof fnbuf, "__cmc_fn_%d", em->fnid++);
     const char *fnname = cmc_arena_strndup(em->ctx->arena, fnbuf, strlen(fnbuf));
@@ -936,8 +1109,54 @@ EStr emit_arrow(Emit *em, CmcNode *n) {
             if (pt[i] == CT_UNKNOWN || pt[i] == CT_VOID) pt[i] = CT_DOUBLE;
         } else { pname[i] = "p"; pdef[i] = NULL; pt[i] = CT_DOUBLE; }
     }
-    CmcType ret = n->is_expr_body ? cmc_type_of(em->ctx, &em->env, n->body) : CT_INT;
+    /* block-bodied arrows: infer the return type from their return statements
+     * (fn_return_type knows that returning a function means CT_MOCHI_VAL) */
+    CmcType ret = n->is_expr_body ? cmc_type_of(em->ctx, &em->env, n->body) : fn_return_type(n);
     if (ret == CT_UNKNOWN || ret == CT_VOID) ret = CT_INT;
+
+    /* closure capture: names used in the body that come from an enclosing
+     * function scope (params/locals), not declared here, not global. */
+    CmcFreeVar fv[16]; int nfv = 0;
+    fv_walk(n->body, fv, &nfv);
+    /* resolve each candidate's type from the CURRENT (enclosing) env */
+    {
+        CmcFreeVar cap[16]; int ncap = 0;
+        for (int i = 0; i < nfv; i++) {
+            if (fv_is_param(n, fv[i].name)) continue;
+            if (fv_is_declared(n->body, fv[i].name)) continue;
+            int dup = 0;
+            for (int j = 0; j < ncap; j++) if (!strcmp(cap[j].name, fv[i].name)) { dup = 1; break; }
+            if (dup) continue;
+            CmcSym *cs = cmc_env_lookup(&em->env, fv[i].name);
+            if (!cs || cs->kind == SYM_FUNC || cs->kind == SYM_GLOBAL) continue;
+            cap[ncap].name = fv[i].name; cap[ncap].type = cs->type; cap[ncap].sn = cs->struct_name;
+            ncap++;
+        }
+        nfv = ncap;
+        for (int i = 0; i < ncap; i++) fv[i] = cap[i];
+    }
+    const char *upstruct = NULL;
+    if (nfv > 0) {
+        upstruct = (char *)0;
+        Buf us; b_init(&us);
+        b_putf(&us, "struct __up_%s {\n", fnname);
+        for (int i = 0; i < nfv; i++) {
+            CmcSym *cs = cmc_env_lookup(&em->env, fv[i].name);
+            CmcType t = cs ? cs->type : CT_DOUBLE;
+            const char *tn = cmc_type_name(t);
+            if (t == CT_STR) tn = "const char *";
+            if (t == CT_OBJ) { const char *sh = cs ? cs->struct_name : NULL;
+                if (sh) { Buf tnb; b_init(&tnb); b_putf(&tnb, "struct %s *", sh); tn = cmc_arena_strndup(em->ctx->arena, tnb.s, tnb.len); free(tnb.s); } }
+            b_putf(&us, "    %s %s;\n", tn, fv[i].name);
+        }
+        b_put(&us, "};\n");
+        b_put(&em->fn_extra, us.s);
+        free(us.s);
+        upstruct = cmc_arena_strndup(em->ctx->arena, (char[]){0}, 0);
+        /* store the struct name as a string */
+        char un[64]; snprintf(un, sizeof un, "__up_%s", fnname);
+        upstruct = cmc_arena_strndup(em->ctx->arena, un, strlen(un));
+    }
 
     vol_pass(em, n->body);
     Buf save = em->out;
@@ -965,7 +1184,11 @@ EStr emit_arrow(Emit *em, CmcNode *n) {
         CmcSym *hs = cmc_env_decl(&em->env, hasname, CT_BOOL, SYM_PARAM);
         hs->has_name = hasname;
     }
+    if (nfv > 0) { if (np > 0) b_put(&sig, ", "); b_put(&sig, "void *__env"); }
     b_put(&sig, ") {");
+    /* set the current function's capture set for emit_ident to rewrite */
+    em->cur_up = upstruct; em->cur_ncapt = nfv;
+    for (int i = 0; i < nfv; i++) { em->cur_capt[i] = fv[i].name; em->cur_capt_type[i] = fv[i].type; }
     e_line(em, sig.s);
     free(sig.s);
     em->indent++;
@@ -994,13 +1217,93 @@ EStr emit_arrow(Emit *em, CmcNode *n) {
     em->indent--;
     e_line(em, "}");
     cmc_env_pop(&em->env);
+    em->cur_up = NULL; em->cur_ncapt = 0;
+    /* re-read em->out: a realloc during emission left body.s stale */
+    body = em->out;
     em->out = save;
     if (!em->fn_extra.s) b_init(&em->fn_extra);
     b_put(&em->fn_extra, body.s);
     b_put(&em->fn_extra, "\n");
     free(body.s);
+    /* first-class shim for this arrow (nullish-guarded signature) */
+    {
+        Buf sh; b_init(&sh);
+        b_putf(&sh, "static %s %s(", cmc_type_name(ret), fnname);
+        for (int i = 0; i < np; i++) {
+            if (i) b_put(&sh, ", ");
+            if (prest[i]) b_putf(&sh, "mochi_array *%s", pname[i]);
+            else b_putf(&sh, "int has_%s, %s %s", pname[i], cmc_type_name(pt[i]), pname[i]);
+        }
+        if (nfv > 0) { if (np > 0) b_put(&sh, ", "); b_put(&sh, "void *__env"); }
+        b_put(&sh, ");\n");
+        b_putf(&sh, "static mochi_val __shim_%s(int argc, mochi_val *argv, void *env) {\n", fnname);
+        b_put(&sh, "    (void)argc; (void)env;\n");
+        b_put(&sh, "    ");
+        b_putf(&sh, "%s __r = %s(", cmc_type_name(ret), fnname);
+        for (int i = 0; i < np; i++) {
+            if (i) b_put(&sh, ", ");
+            if (prest[i]) {
+                b_putf(&sh, "(mochi_array_from_argv(argv, %d, argc))", i);
+            } else if (pt[i] == CT_STR) {
+                b_putf(&sh, "(argc > %d ? 1 : 0), (argc > %d ? mochi_str_or_empty(argv[%d]) : \"\")", i, i, i);
+            } else if (pt[i] == CT_ARR) {
+                b_putf(&sh, "(argc > %d ? 1 : 0), (argc > %d ? mochi_arr_or_empty(argv[%d]) : NULL)", i, i, i);
+            } else if (pt[i] == CT_OBJ) {
+                b_putf(&sh, "(argc > %d ? 1 : 0), (argc > %d && argv[%d].p ? (struct %s *)argv[%d].p : NULL)",
+                       i, i, i, pname[i] ? pname[i] : "CmcStruct_1", i);
+            } else if (pt[i] == CT_MOCHI_VAL) {
+                b_putf(&sh, "(argc > %d ? 1 : 0), (argc > %d ? argv[%d] : mochi_undef())", i, i, i);
+            } else if (pt[i] == CT_BOOL) {
+                b_putf(&sh, "(argc > %d ? 1 : 0), (argc > %d ? mochi_val_bool(argv[%d]) : 0)", i, i, i);
+            } else {
+                b_putf(&sh, "(argc > %d ? 1 : 0), (argc > %d ? mochi_val_num(argv[%d]) : 0)", i, i, i);
+            }
+        }
+        if (nfv > 0) { if (np > 0) b_put(&sh, ", "); b_put(&sh, "env"); }
+        b_put(&sh, ");\n");
+        b_put(&sh, "    ");
+        if (ret == CT_STR) b_put(&sh, "return mochi_str(__r);\n");
+        else if (ret == CT_BOOL) b_put(&sh, "return mochi_bool(__r);\n");
+        else if (ret == CT_ARR) b_put(&sh, "return mochi_arr_box(__r);\n");
+        else if (ret == CT_OBJ) b_put(&sh, "return mochi_obj_box(__r);\n");
+        else if (ret == CT_MOCHI_VAL) b_put(&sh, "return __r;\n");
+        else b_put(&sh, "return mochi_num((double)__r);\n");
+        b_put(&sh, "}\n");
+        b_put(&em->fn_extra, sh.s);
+        free(sh.s);
+    }
     free(pt); free(pname); free(pdef);
-    return estr(fnname, CT_UNKNOWN, 0, 0, NULL);
+    char boxbuf[96];
+    if (nfv > 0) {
+        /* allocate the env struct and snapshot the captured locals now */
+        const char *up = tmp_name(em, "up");
+        Buf mk; b_init(&mk);
+        b_putf(&mk, "struct %s *%s = (struct %s *)CMC_ALLOC(sizeof(struct %s));", upstruct, up, upstruct, upstruct);
+        /* emitted straight into the enclosing body: em->out is already restored */
+        e_line(em, mk.s); free(mk.s);
+        for (int i = 0; i < nfv; i++) {
+            Buf st; b_init(&st);
+            /* the captured name is in scope at the boxing site (enclosing fn) —
+             * unless THIS arrow captured it too, in which case read it from
+             * our own env (nested closure). */
+            const char *src = fv[i].name;
+            char nb2[128];
+            for (int j = 0; j < enc_ncap; j++) {
+                if (enc_capt[j] && !strcmp(enc_capt[j], fv[i].name) && enc_up) {
+                    snprintf(nb2, sizeof nb2, "((struct %s *)__env)->%s", enc_up, fv[i].name);
+                    src = cmc_arena_strndup(em->ctx->arena, nb2, strlen(nb2));
+                    break;
+                }
+            }
+            b_putf(&st, "%s->%s = %s;", up, fv[i].name, src);
+            e_line(em, st.s); free(st.s);
+        }
+        snprintf(boxbuf, sizeof boxbuf, "mochi_fn_box_n(__shim_%s, %s, \"%s\")", fnname, up, fnname);
+    } else {
+        snprintf(boxbuf, sizeof boxbuf, "mochi_fn_box_n(__shim_%s, NULL, \"%s\")", fnname, fnname);
+    }
+    const char *box = cmc_arena_strndup(em->ctx->arena, boxbuf, strlen(boxbuf));
+    return estr(box, CT_MOCHI_VAL, 0, 0, NULL);
 }
 
 /* nullish-ness guard for a call argument: writes a C int expression that is
@@ -1258,9 +1561,41 @@ static void emit_assign_helper(Emit *em, const char *ss, const char *ts) {
     free(g.s);
 }
 
+/* call a boxed function value: build a mochi_val argv[] pre-line and
+ * dispatch through mochi_call (runtime tag t=5). */
+void emit_mochi_call(Emit *em, Buf *b, const char *fnv, CmcNode *n, EStr *args) {
+    const char *av = tmp_name(em, "argv");
+    Buf mk; b_init(&mk);
+    b_putf(&mk, "mochi_val %s[%d];", av, n->nargs ? n->nargs : 1);
+    e_preline(em, mk.s); free(mk.s);
+    for (int i = 0; i < n->nargs; i++) {
+        Buf v; b_init(&v); co_box(&v, args[i]);
+        Buf st; b_init(&st);
+        b_putf(&st, "%s[%d] = %s;", av, i, v.s);
+        e_preline(em, st.s); free(st.s); free(v.s);
+    }
+    b_putf(b, "mochi_call(%s, %d, %s)", fnv, n->nargs, av);
+}
+
+/* call through a stored function value (arr[i](...), obj.fn(...) where the
+ * value is a boxed function): dispatch via mochi_call. */
+EStr emit_stored_fn_call(Emit *em, CmcNode *n, EStr o) {
+    EStr *args = (EStr *)malloc(sizeof(EStr) * (n->nargs ? n->nargs : 1));
+    for (int i = 0; i < n->nargs; i++) args[i] = emit_expr(em, n->args[i]);
+    Buf b; b_init(&b);
+    emit_mochi_call(em, &b, o.code, n, args);
+    free(args);
+    return estr(b.s, CT_MOCHI_VAL, 0, 0, NULL);
+}
+
 EStr emit_call(Emit *em, CmcNode *n) {
     CmcNode *callee = n->obj;
     if (n->is_new) return emit_new(em, n); /* `new Ctor(...)` */
+    /* the callee is itself a call returning a boxed function: (f())() */
+    if (callee->kind == N_CALL) {
+        EStr fnv = emit_call(em, callee);
+        return emit_stored_fn_call(em, n, fnv);
+    }
     if (callee->kind == N_IDENT) {
         const char *nm = callee->name;
         if (strcmp(nm, "console") == 0) {
@@ -1316,7 +1651,11 @@ EStr emit_call(Emit *em, CmcNode *n) {
                             arg_has(em, n->args[i], &h);
                             b_putf(&b, "%s, ", h.s);
                             free(h.s);
-                            if (args[i].type == CT_STR) co_str(em, &b, args[i]);
+                            if (pt == CT_MOCHI_VAL) {
+                                if (args[i].type == CT_MOCHI_VAL) b_put(&b, args[i].code);
+                                else { Buf bx; b_init(&bx); co_box(&bx, args[i]); b_put(&b, bx.s); free(bx.s); }
+                            }
+                            else if (args[i].type == CT_STR) co_str(em, &b, args[i]);
                             else co_num(em, &b, args[i]);
                         } else {
                             /* omitted arg: not present -> has=0, value 0/NULL */
@@ -1341,7 +1680,14 @@ EStr emit_call(Emit *em, CmcNode *n) {
                         } else if (i < n->nargs) {
                             const char *psh2 = (fn && i < fn->nparams && fn->params[i] && fn->params[i]->kind == N_IDENT)
                                 ? cmc_param_shape(fn->fname, fn->params[i]->name) : NULL;
-                            if (psh2) b_putf(&b, "%s", args[i].code);
+                            CmcType pt2 = CT_DOUBLE;
+                            if (fn && i < fn->nparams && fn->params[i] && fn->params[i]->kind == N_IDENT)
+                                pt2 = infer_param_type_lite(em, fn, fn->params[i]->name);
+                            if (pt2 == CT_MOCHI_VAL) {
+                                if (args[i].type == CT_MOCHI_VAL) b_put(&b, args[i].code);
+                                else { Buf bx; b_init(&bx); co_box(&bx, args[i]); b_put(&b, bx.s); free(bx.s); }
+                            }
+                            else if (psh2) b_putf(&b, "%s", args[i].code);
                             else if (args[i].type == CT_STR) co_str(em, &b, args[i]);
                             else co_num(em, &b, args[i]);
                         } else b_put(&b, "0");
@@ -1357,6 +1703,14 @@ EStr emit_call(Emit *em, CmcNode *n) {
                 t = s->type;
                 rsh = fn_return_shape(em, fn);
             } else {
+                /* a variable/param holding a boxed function value */
+                if (s && s->type == CT_MOCHI_VAL) {
+                    Buf cv; b_init(&cv); b_putf(&cv, "%s", s->cname);
+                    emit_mochi_call(em, &b, cv.s, n, args);
+                    free(cv.s);
+                    free(args);
+                    return estr(b.s, CT_MOCHI_VAL, 0, 0, NULL);
+                }
                 b_putf(&b, "%s(", nm);
                 for (int i = 0; i < n->nargs; i++) { if (i) b_put(&b, ", "); co_num(em, &b, args[i]); }
                 b_put(&b, ")");
@@ -1369,7 +1723,13 @@ EStr emit_call(Emit *em, CmcNode *n) {
     if (callee->kind == N_MEMBER) {
         CmcNode *m = callee;
         EStr o = emit_expr(em, m->obj);
-        const char *prop = m->prop ? m->prop->name : "";
+        const char *prop = (m->prop && m->prop->name) ? m->prop->name : "";
+        /* a computed member call (arr[i](...)) is a call through the element
+         * value, not a method call — handled as a stored-function call below */
+        if (m->computed || !m->prop || !m->prop->name) {
+            EStr elem = emit_member(em, m);
+            return emit_stored_fn_call(em, n, elem);
+        }
         if (m->obj && m->obj->kind == N_IDENT && m->obj->name &&
                 strcmp(m->obj->name, "JSON") == 0 && strcmp(prop, "stringify") == 0 &&
                 n->nargs == 1) {
@@ -1907,6 +2267,15 @@ CmcType fn_return_type(CmcNode *fn) {
             else if (a->kind == N_NULL) t = CT_NULL;
             else if (a->kind == N_ARR) t = CT_ARR;
             else if (a->kind == N_OBJ) t = CT_OBJ;
+            else if (a->kind == N_ARROW || a->kind == N_FUNC) t = CT_MOCHI_VAL;
+            else if (a->kind == N_CALL && a->obj && a->obj->kind == N_IDENT) {
+                /* a call through a boxed callable (var/param callee) */
+                const char *cn = a->obj->name;
+                int isparam = 0;
+                for (int i = 0; i < fn->nparams; i++)
+                    if (fn->params[i]->kind == N_IDENT && fn->params[i]->name && !strcmp(fn->params[i]->name, cn)) { isparam = 1; break; }
+                if (isparam) t = CT_MOCHI_VAL;
+            }
             else if (is_str_expr(a)) t = CT_STR; /* concat / template */
             if (ret == CT_VOID) ret = t;
             else if (t == CT_STR || ret == CT_STR) ret = CT_STR;
@@ -1935,6 +2304,7 @@ CmcType fn_return_type(CmcNode *fn) {
         if (b->kind == N_NULL) return CT_NULL;
         if (b->kind == N_ARR) return CT_ARR;
         if (b->kind == N_OBJ) return CT_OBJ;
+        if (b->kind == N_ARROW || b->kind == N_FUNC) return CT_MOCHI_VAL;
         if (b->kind == N_BIN) {
             if (b->op == TK_PLUS) {
                 /* string concat if either side is a string literal */
@@ -1979,7 +2349,12 @@ CmcType infer_param_type_lite(Emit *em, CmcNode *fn, const char *pname) {
         else if (cur->kind == N_VAR) for (int i = 0; i < cur->nstmts; i++) stack[sp++] = cur->stmts[i];
         else if (cur->kind == N_EXPRSTMT) stack[sp++] = cur->lhs;
         else if (cur->kind == N_RETURN) stack[sp++] = cur->lhs;
-        else if (cur->kind == N_CALL) { stack[sp++] = cur->obj; for (int i = 0; i < cur->nargs; i++) stack[sp++] = cur->args[i]; }
+        else if (cur->kind == N_CALL) {
+            /* a param used as the callee of a call is a boxed callable */
+            if (cur->obj && cur->obj->kind == N_IDENT && cur->obj->name &&
+                !strcmp(cur->obj->name, pname)) return CT_MOCHI_VAL;
+            stack[sp++] = cur->obj; for (int i = 0; i < cur->nargs; i++) stack[sp++] = cur->args[i];
+        }
         else if (cur->kind == N_MEMBER) { stack[sp++] = cur->obj; stack[sp++] = cur->prop; }
         else if (cur->kind == N_ASSIGN) { stack[sp++] = cur->lhs; stack[sp++] = cur->rhs; }
         else if (cur->kind == N_UNARY) stack[sp++] = cur->lhs;
@@ -2032,6 +2407,64 @@ void emit_function(Emit *em, CmcNode *fn) {
     emit_block(em, fn->body);
     em->indent--;
     e_line(em, "}");
+    /* first-class shim: uniform callable ABI for this function */
+    {
+        Buf sh; b_init(&sh);
+        /* forward decl so the shim can call the (later-defined) function */
+        if (rshape) b_putf(&sh, "static struct %s * %s(", rshape, fn->fname);
+        else b_putf(&sh, "static %s %s(", cmc_type_name(ret == CT_VOID ? CT_INT : ret), fn->fname);
+        for (int i = 0; i < fn->nparams; i++) {
+            if (i) b_put(&sh, ", ");
+            if (fn->params[i]->is_rest && fn->params[i]->kind == N_IDENT)
+                b_putf(&sh, "mochi_array *%s", fn->params[i]->name);
+            else if (fn->params[i]->kind == N_IDENT) {
+                const char *psh = cmc_param_shape(fn->fname, fn->params[i]->name);
+                if (psh) b_putf(&sh, "struct %s * %s", psh, fn->params[i]->name);
+                else b_putf(&sh, "%s %s", cmc_type_name(pt[i]), fn->params[i]->name);
+            } else b_put(&sh, "double p");
+        }
+        b_put(&sh, ");\n");
+        b_putf(&sh, "static mochi_val __shim_%s(int argc, mochi_val *argv, void *env) {\n", fn->fname);
+        b_put(&sh, "    (void)argc; (void)env;\n");
+        b_put(&sh, "    ");
+        if (rshape) b_putf(&sh, "struct %s *", rshape);
+        else if (ret == CT_VOID) b_putf(&sh, "int");
+        else b_putf(&sh, "%s", cmc_type_name(ret));
+        b_putf(&sh, " __r = %s(", fn->fname);
+        for (int i = 0; i < fn->nparams; i++) {
+            if (i) b_put(&sh, ", ");
+            const char *pn = (fn->params[i]->kind == N_IDENT) ? fn->params[i]->name : "p";
+            if (fn->params[i]->is_rest) {
+                b_putf(&sh, "(mochi_array_from_argv(argv, %d, argc))", i);
+            } else if (pt[i] == CT_STR) {
+                b_putf(&sh, "(argc > %d ? mochi_str_or_empty(argv[%d]) : \"\")", i, i);
+            } else if (pt[i] == CT_ARR) {
+                b_putf(&sh, "(argc > %d ? mochi_arr_or_empty(argv[%d]) : NULL)", i, i);
+            } else if (pt[i] == CT_OBJ) {
+                const char *psh = (fn->params[i]->kind == N_IDENT)
+                    ? cmc_param_shape(fn->fname, pn) : NULL;
+                b_putf(&sh, "(argc > %d && argv[%d].p ? (struct %s *)argv[%d].p : NULL)",
+                       i, i, psh ? psh : "CmcStruct_1", i);
+            } else if (pt[i] == CT_MOCHI_VAL) {
+                b_putf(&sh, "(argc > %d ? argv[%d] : mochi_undef())", i, i);
+            } else if (pt[i] == CT_BOOL) {
+                b_putf(&sh, "(argc > %d ? mochi_val_bool(argv[%d]) : 0)", i, i);
+            } else {
+                b_putf(&sh, "(argc > %d ? mochi_val_num(argv[%d]) : 0)", i, i);
+            }
+        }
+        b_put(&sh, ");\n");
+        b_put(&sh, "    ");
+        if (ret == CT_STR) b_put(&sh, "return mochi_str(__r);\n");
+        else if (ret == CT_BOOL) b_put(&sh, "return mochi_bool(__r);\n");
+        else if (ret == CT_ARR) b_put(&sh, "return mochi_arr_box(__r);\n");
+        else if (ret == CT_OBJ && rshape) b_put(&sh, "return mochi_obj_box(__r);\n");
+        else if (ret == CT_MOCHI_VAL) b_put(&sh, "return __r;\n");
+        else b_put(&sh, "return mochi_num((double)__r);\n");
+        b_put(&sh, "}\n");
+        b_put(&em->fn_extra, sh.s);
+        free(sh.s);
+    }
     cmc_env_pop(&em->env);
     free(pt);
 }

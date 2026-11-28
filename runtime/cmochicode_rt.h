@@ -61,6 +61,24 @@ static void mochi_throw(const char *msg) {
 /* ---------- tagged value + dynamic array ---------- */
 typedef struct { unsigned char t; double n; const char *s; void *p; } mochi_val;
 static mochi_val mochi_undef(void);
+/* ---------- first-class function values ---------- */
+typedef mochi_val (*mochi_fn_ptr)(int argc, mochi_val *argv, void *env);
+typedef struct { mochi_fn_ptr fn; void *env; const char *name; } mochi_fnrec;
+static mochi_val mochi_fn_box_n(mochi_fn_ptr fn, void *env, const char *name) {
+    mochi_fnrec *r = (mochi_fnrec *)CMC_ALLOC(sizeof(mochi_fnrec));
+    r->fn = fn; r->env = env; r->name = name;
+    mochi_val v; v.t = 5; v.n = 0; v.s = NULL; v.p = r; return v;
+}
+static mochi_val mochi_fn_box(mochi_fn_ptr fn, void *env) {
+    return mochi_fn_box_n(fn, env, NULL);
+}
+static mochi_val mochi_call(mochi_val v, int argc, mochi_val *argv) {
+    if (v.t == 5 && v.p)
+        return ((mochi_fnrec *)v.p)->fn(argc, argv, ((mochi_fnrec *)v.p)->env);
+    fprintf(stderr, "TypeError: not a function\n");
+    return mochi_undef();
+}
+static mochi_val mochi_undef(void);
 /* ---------- dynamic string-key map (overflow storage) ---------- */
 /* A shape object may need to hold keys that were only ever written through a
  * runtime expression (obj[k] = v): the static struct fields are checked
@@ -146,6 +164,13 @@ static inline const char *mochi_val_str(mochi_val v){
     if (v.t==0) { static char b[4][32]; static int bi=0; bi=(bi+1)&3; snprintf(b[bi],32,"%g",v.n); return b[bi]; }
     if (v.t==2) return v.n ? "true" : "false";
     if (v.t==3) return "null";
+    if (v.t==5 && v.p) {
+        const char *nm = ((mochi_fnrec *)v.p)->name;
+        static char fb[64];
+        if (nm) { snprintf(fb, sizeof fb, "[Function: %s]", nm); return fb; }
+        return "[Function]";
+    }
+    if (v.t==5) return "[Function]";
     if (v.t==6) return "undefined";
     return "";
 }
@@ -192,6 +217,11 @@ static inline mochi_array *mochi_array_slice(mochi_array *a, int s, int e) {
     if (e < 0) e = 0;
     if (e > n) e = n;
     for (int i = s; i < e; i++) mochi_array_push(r, a->items[i]);
+    return r;
+}
+static inline mochi_array *mochi_array_from_argv(mochi_val *argv, int start, int argc) {
+    mochi_array *r = mochi_array_new();
+    for (int i = start; i < argc; i++) mochi_array_push(r, argv[i]);
     return r;
 }
 static inline mochi_array *mochi_array_reverse(mochi_array *a) {

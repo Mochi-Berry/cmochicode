@@ -45,6 +45,11 @@ typedef struct {
     const char *dk_shapes[64]; int dk_n;   /* shapes with runtime-key get/set helpers */
     const char *keys_shapes[64]; int keys_n;  /* shapes with a _keys helper */
     const char *asg_pairs[64]; int asg_n;      /* 'src|tgt' Object.assign helpers */
+    /* closure capture: the current function's upvalue env (for nested arrows) */
+    const char *cur_up;        /* "struct __up_<fn>" or NULL */
+    const char *cur_capt[16];  /* captured names */
+    CmcType     cur_capt_type[16];
+    int         cur_ncapt;
 } Emit;
 
 /* prototypes (all functions share the Emit/Buf/EStr types) */
@@ -120,6 +125,7 @@ void emit_forin(Emit *em, CmcNode *n);
 void emit_switch(Emit *em, CmcNode *n);
 void emit_stmt(Emit *em, CmcNode *n);
 CmcType fn_return_type(CmcNode *fn);
+int arrow_captures(Emit *em, CmcNode *arrow);
 CmcType infer_param_type_lite(Emit *em, CmcNode *fn, const char *pname);
 void emit_function(Emit *em, CmcNode *fn);
 char *cmc_emit(CmcCtx *ctx, CmcNode *program);

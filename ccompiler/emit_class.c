@@ -219,6 +219,7 @@ const char *emit_class_method(Emit *em, CmcNode *cls, CmcProp *pr,
     em->this_name = save_this;
     e_line(em, "}");
     cmc_env_pop(&em->env);
+    body = em->out; /* refreshed: a realloc during emission left body.s stale */
     em->out = save;
     if (!em->fn_extra.s) b_init(&em->fn_extra);
     b_put(&em->fn_extra, body.s);
