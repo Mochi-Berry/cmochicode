@@ -349,6 +349,78 @@ static inline const char *mochi_toupper(const char *s) {
     for (size_t i = 0; i < l; i++) { char c = s[i]; o[i] = (c >= 'a' && c <= 'z') ? c - 32 : c; }
     o[l] = 0; return o;
 }
+/* --- dynamic receiver dispatch: a mochi_val may hold a string or an array,
+ * so the method has to be chosen at runtime (JS semantics) --- */
+static inline const char *mochi_slice(const char *s, int a, int b);
+static inline mochi_array *mochi_array_slice(mochi_array *a, int s, int e);
+static inline mochi_val mochi_array_at(mochi_array *a, int i);
+static inline const char *mochi_str_at(const char *s, int i);
+static inline int mochi_str_last_index_of(const char *s, const char *needle);
+static inline const char *mochi_str_concat2(const char *a, const char *b);
+static inline int mochi_index_of(const char *s, const char *needle, int from);
+static inline int mochi_includes(const char *s, const char *sub);
+static inline mochi_array *mochi_array_concat(mochi_array *a, mochi_array *b);
+static inline int mochi_val_length(mochi_val v) {
+    if (v.t == 4 && v.p) return ((mochi_array *)v.p)->len;
+    if (v.t == 1 && v.s) return (int)strlen(v.s);
+    return 0;
+}
+static inline mochi_val mochi_dyn_slice(mochi_val v, int a, int b) {
+    if (v.t == 4 && v.p) return mochi_arr_box(mochi_array_slice((mochi_array *)v.p, a, b));
+    if (v.t == 1 && v.s) return mochi_str(mochi_slice(v.s, a, b));
+    return mochi_undef();
+}
+static inline int mochi_dyn_index_of(mochi_val v, const char *needle) {
+    if (v.t == 4 && v.p) {
+        mochi_array *a = (mochi_array *)v.p;
+        for (int i = 0; i < a->len; i++)
+            if (a->items[i].t == 1 && a->items[i].s && !strcmp(a->items[i].s, needle)) return i;
+        return -1;
+    }
+    if (v.t == 1 && v.s) return mochi_index_of(v.s, needle, 0);
+    return -1;
+}
+static inline int mochi_dyn_last_index_of(mochi_val v, const char *needle) {
+    if (v.t == 4 && v.p) {
+        mochi_array *a = (mochi_array *)v.p;
+        for (int i = a->len - 1; i >= 0; i--)
+            if (a->items[i].t == 1 && a->items[i].s && !strcmp(a->items[i].s, needle)) return i;
+        return -1;
+    }
+    if (v.t == 1 && v.s) return mochi_str_last_index_of(v.s, needle);
+    return -1;
+}
+static inline int mochi_dyn_includes(mochi_val v, const char *needle) {
+    if (v.t == 4 && v.p) {
+        mochi_array *a = (mochi_array *)v.p;
+        for (int i = 0; i < a->len; i++)
+            if (a->items[i].t == 1 && a->items[i].s && !strcmp(a->items[i].s, needle)) return 1;
+        return 0;
+    }
+    if (v.t == 1 && v.s) return mochi_includes(v.s, needle);
+    return 0;
+}
+static inline mochi_val mochi_dyn_at(mochi_val v, int i) {
+    if (v.t == 4 && v.p) return mochi_array_at((mochi_array *)v.p, i);
+    if (v.t == 1 && v.s) return mochi_str(mochi_str_at(v.s, i));
+    return mochi_undef();
+}
+static inline mochi_val mochi_dyn_concat(mochi_val v, mochi_val other) {
+    if (v.t == 4 && v.p) {
+        mochi_array *r = mochi_array_concat((mochi_array *)v.p, NULL);
+        mochi_array_push(r, other);
+        return mochi_arr_box(r);
+    }
+    if (v.t == 1 && v.s) {
+        const char *o = other.t == 1 && other.s ? other.s : mochi_val_str(other);
+        return mochi_str(mochi_str_concat2(v.s, o));
+    }
+    return mochi_undef();
+}
+/* unbox a possibly-string mochi_val: "" when not a string */
+static inline const char *mochi_str_or_empty(mochi_val v) {
+    return v.t == 1 && v.s ? v.s : "";
+}
 static inline const char *mochi_tolower(const char *s) {
     size_t l = strlen(s); char *o = (char *)CMC_ALLOC(l + 1);
     for (size_t i = 0; i < l; i++) { char c = s[i]; o[i] = (c >= 'A' && c <= 'Z') ? c + 32 : c; }
@@ -404,6 +476,67 @@ static inline const char *mochi_replace(const char *s, const char *from, const c
     memcpy(o, s, before); memcpy(o + before, to, lt);
     memcpy(o + before + lt, p + lf, l - before - lf + 1);
     return o;
+}
+static inline const char *mochi_replace_all(const char *s, const char *from, const char *to) {
+    if (!*from) return s;
+    size_t lf = strlen(from), lt = strlen(to), l = strlen(s);
+    size_t count = 0;
+    for (const char *p = strstr(s, from); p; p = strstr(p + lf, from)) count++;
+    if (!count) return s;
+    char *o = (char *)CMC_ALLOC(l + count * (lt > lf ? lt - lf : 0) + 1);
+    char *w = o;
+    const char *p = s;
+    for (const char *h = strstr(p, from); h; h = strstr(p, from)) {
+        memcpy(w, p, (size_t)(h - p)); w += h - p;
+        memcpy(w, to, lt); w += lt;
+        p = h + lf;
+    }
+    size_t rest = strlen(p); memcpy(w, p, rest); w[rest] = 0;
+    return o;
+}
+static inline int mochi_str_last_index_of(const char *s, const char *needle) {
+    int ls = (int)strlen(s), ln = (int)strlen(needle);
+    for (int i = ls - ln; i >= 0; i--)
+        if (!strncmp(s + i, needle, (size_t)ln)) return i;
+    return -1;
+}
+static inline int mochi_char_code_at(const char *s, int i) {
+    if (i < 0 || (size_t)i >= strlen(s)) return -1;
+    return (int)(unsigned char)s[i];
+}
+static inline const char *mochi_str_concat2(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    char *o = (char *)CMC_ALLOC(la + lb + 1);
+    memcpy(o, a, la); memcpy(o + la, b, lb); o[la + lb] = 0;
+    return o;
+}
+static inline const char *mochi_str_at(const char *s, int i) {
+    if (i < 0) i += (int)strlen(s);
+    if (i < 0 || (size_t)i >= strlen(s)) return "undefined";
+    static char b[2]; b[0] = s[i]; b[1] = 0; return b;
+}
+/* JS substring(start, end): end exclusive, negatives wrap, args swap */
+static inline const char *mochi_substring(const char *s, int st, int en) {
+    int l = (int)strlen(s);
+    if (st < 0) st = 0; if (en < 0) en = 0;
+    if (st > l) st = l; if (en > l) en = l;
+    if (st > en) { int t = st; st = en; en = t; }
+    return mochi_substr(s, st, en - st);
+}
+static inline mochi_array *mochi_split_limit(const char *s, const char *sep, int limit) {
+    mochi_array *a = mochi_array_new();
+    if (limit <= 0) return a;
+    size_t sl = strlen(sep);
+    const char *start = s;
+    while (a->len < limit) {
+        const char *p = sl ? strstr(start, sep) : NULL;
+        if (!p) { mochi_array_push(a, mochi_str(start)); break; }
+        size_t n = (size_t)(p - start);
+        char *t = (char *)CMC_ALLOC(n + 1); memcpy(t, start, n); t[n] = 0;
+        mochi_array_push(a, mochi_str(t));
+        start = p + sl;
+    }
+    return a;
 }
 static inline mochi_array *mochi_split(const char *s, const char *sep) {
     mochi_array *a = mochi_array_new();

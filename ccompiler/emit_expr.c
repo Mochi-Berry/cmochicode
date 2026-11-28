@@ -49,6 +49,11 @@ EStr emit_member_field(Emit *em, EStr o, CmcNode *obj_node, const char *prop, in
             b_putf(&b, "(int)strlen(%s)", o.code);
             return estr(b.s, CT_INT, 0, 0, NULL);
         }
+    if (o.type == CT_MOCHI_VAL && strcmp(prop, "length") == 0) {
+            Buf b; b_init(&b);
+            b_putf(&b, "mochi_val_length(%s)", o.code);
+            return estr(b.s, CT_INT, 0, 0, NULL);
+        }
         /* function.length: params before the first default / rest */
         if (strcmp(prop, "length") == 0 && obj_node && obj_node->kind == N_IDENT) {
             CmcSym *s = cmc_env_lookup(&em->env, obj_node->name);
@@ -1509,12 +1514,83 @@ EStr emit_call(Emit *em, CmcNode *n) {
             free(args);
             return estr(b.s, t, 0, 0, NULL);
         }
+        /* process.stdout.write(x): print without trailing newline */
+        if (m->obj->kind == N_MEMBER && m->obj->obj &&
+            m->obj->obj->kind == N_IDENT && strcmp(m->obj->obj->name, "process") == 0 &&
+            m->obj->prop && m->obj->prop->kind == N_IDENT && strcmp(m->obj->prop->name, "stdout") == 0 &&
+            strcmp(prop, "write") == 0) {
+            EStr *args = (EStr *)malloc(sizeof(EStr) * (n->nargs ? n->nargs : 1));
+            for (int i = 0; i < n->nargs; i++) args[i] = emit_expr(em, n->args[i]);
+            Buf b; b_init(&b);
+            b_put(&b, "printf(\"%s\"");
+            for (int i = 0; i < n->nargs; i++) {
+                if (args[i].type == CT_STR) { b_put(&b, ", "); b_put(&b, args[i].code); }
+                else if (args[i].type == CT_DOUBLE || args[i].type == CT_INT) { b_put(&b, ", \"%g\""); b_put(&b, ", "); b_put(&b, args[i].code); }
+                else b_putf(&b, ", mochi_val_str_js(%s)", args[i].code);
+            }
+            b_put(&b, ")");
+            return estr(b.s, CT_INT, 0, 0, NULL);
+        }
         if (o.type == CT_MOCHI_VAL) {
-            /* array boxed in a dynamic value (Object.entries()[0], map() over
-             * boxed elements, ...): unbox so the array methods still work */
-            char *ub = (char *)malloc(strlen(o.code) + 32);
-            sprintf(ub, "mochi_arr_or_empty(%s)", o.code);
-            o.code = ub; o.type = CT_ARR;
+            /* A dynamic value (array element, map value) can be a string or an
+             * array at runtime — pick the family by method name. */
+            static const char *arr_methods[] = {"push","pop","shift","unshift","splice",
+                "sort","fill","flat","reverse","map","filter","reduce","forEach",
+                "some","every","find","findIndex","join","toString",NULL};
+            static const char *str_methods[] = {"trim","toUpperCase","toLowerCase",
+                "charAt","charCodeAt","substring","substr","replace","replaceAll",
+                "split","padStart","padEnd","repeat","startsWith","endsWith",NULL};
+            static const char *ambig[] = {"slice","indexOf","lastIndexOf","includes",
+                "concat","at",NULL};
+            const char *o_code = o.code;
+            int is_arr = 0, is_str = 0, is_amb = 0;
+            for (int i = 0; arr_methods[i]; i++) if (!strcmp(prop, arr_methods[i])) is_arr = 1;
+            for (int i = 0; str_methods[i]; i++) if (!strcmp(prop, str_methods[i])) is_str = 1;
+            for (int i = 0; ambig[i]; i++) if (!strcmp(prop, ambig[i])) is_amb = 1;
+            if (is_arr || (is_amb && 0)) {
+                char *ub = (char *)malloc(strlen(o_code) + 32);
+                sprintf(ub, "mochi_arr_or_empty(%s)", o_code);
+                o.code = ub; o.type = CT_ARR;
+            } else if (is_str) {
+                char *ub = (char *)malloc(strlen(o_code) + 32);
+                sprintf(ub, "mochi_str_or_empty(%s)", o_code);
+                o.code = ub; o.type = CT_STR;
+            } else if (is_amb) {
+                /* runtime dispatch: the receiver decides string vs array */
+                Buf b; b_init(&b);
+                EStr *a = (EStr *)malloc(sizeof(EStr) * (n->nargs ? n->nargs : 1));
+                for (int i = 0; i < n->nargs; i++) a[i] = emit_expr(em, n->args[i]);
+                if (!strcmp(prop, "slice")) {
+                    Buf s0, e0; b_init(&s0); b_init(&e0);
+                    co_num(em, &s0, n->nargs > 0 ? a[0] : estr("0", CT_INT, 0, 0, NULL));
+                    b_putf(&e0, "mochi_val_length(%s)", o_code);
+                    b_putf(&b, "mochi_dyn_slice(%s, %s, %s)", o_code, s0.s, e0.s);
+                    free(s0.s); free(e0.s);
+                } else if (!strcmp(prop, "indexOf")) {
+                    Buf s0; b_init(&s0); co_str(em, &s0, a[0]);
+                    b_putf(&b, "mochi_dyn_index_of(%s, %s)", o_code, s0.s); free(s0.s);
+                    free(a);
+                    return estr(b.s, CT_INT, 0, 0, NULL);
+                } else if (!strcmp(prop, "lastIndexOf")) {
+                    Buf s0; b_init(&s0); co_str(em, &s0, a[0]);
+                    b_putf(&b, "mochi_dyn_last_index_of(%s, %s)", o_code, s0.s); free(s0.s);
+                    free(a);
+                    return estr(b.s, CT_INT, 0, 0, NULL);
+                } else if (!strcmp(prop, "includes")) {
+                    Buf s0; b_init(&s0); co_str(em, &s0, a[0]);
+                    b_putf(&b, "mochi_dyn_includes(%s, %s)", o_code, s0.s); free(s0.s);
+                    free(a);
+                    return estr(b.s, CT_BOOL, 0, 0, NULL);
+                } else if (!strcmp(prop, "at")) {
+                    Buf i0; b_init(&i0); co_num(em, &i0, a[0]);
+                    b_putf(&b, "mochi_dyn_at(%s, %s)", o_code, i0.s); free(i0.s);
+                } else if (!strcmp(prop, "concat")) {
+                    Buf oth; b_init(&oth); co_box(&oth, a[0]);
+                    b_putf(&b, "mochi_dyn_concat(%s, %s)", o_code, oth.s); free(oth.s);
+                }
+                free(a);
+                return estr(b.s, CT_MOCHI_VAL, 0, 0, NULL);
+            }
         }
         if (o.type == CT_ARR) {
             EStr *args = (EStr *)malloc(sizeof(EStr) * (n->nargs ? n->nargs : 1));
@@ -1633,6 +1709,12 @@ EStr emit_call(Emit *em, CmcNode *n) {
             free(args);
             return estr(b.s, t, 0, t == CT_STR ? 1 : 0, NULL);
         }
+        if (o.type == CT_MOCHI_VAL) {
+            /* a string boxed in a dynamic value (array element, map value) */
+            char *ub = (char *)malloc(strlen(o.code) + 32);
+            sprintf(ub, "mochi_str_or_empty(%s)", o.code);
+            o.code = ub; o.type = CT_STR;
+        }
         if (o.type == CT_STR) {
             EStr *args = (EStr *)malloc(sizeof(EStr) * (n->nargs ? n->nargs : 1));
             for (int i = 0; i < n->nargs; i++) args[i] = emit_expr(em, n->args[i]);
@@ -1641,8 +1723,32 @@ EStr emit_call(Emit *em, CmcNode *n) {
             if (strcmp(prop, "toUpperCase") == 0) b_putf(&b, "mochi_toupper(%s)", o.code);
             else if (strcmp(prop, "toLowerCase") == 0) b_putf(&b, "mochi_tolower(%s)", o.code);
             else if (strcmp(prop, "charAt") == 0) b_putf(&b, "mochi_char_at(%s, %s)", o.code, args[0].code);
-            else if (strcmp(prop, "substring") == 0 || strcmp(prop, "substr") == 0)
+            else if (strcmp(prop, "substring") == 0)
+                b_putf(&b, "mochi_substring(%s, %s, %s)", o.code, args[0].code,
+                        n->nargs > 1 ? args[1].code : "(int)strlen(%s)");
+            else if (strcmp(prop, "substr") == 0)
                 b_putf(&b, "mochi_substr(%s, %s, %s)", o.code, args[0].code, n->nargs > 1 ? args[1].code : "-1");
+            else if (strcmp(prop, "replaceAll") == 0)
+                b_putf(&b, "mochi_replace_all(%s, %s, %s)", o.code, args[0].code, args[1].code);
+            else if (strcmp(prop, "lastIndexOf") == 0) {
+                b_putf(&b, "mochi_str_last_index_of(%s, %s)", o.code, args[0].code);
+                t = CT_INT;
+            } else if (strcmp(prop, "charCodeAt") == 0) {
+                b_putf(&b, "mochi_char_code_at(%s, %s)", o.code, args[0].code);
+                t = CT_INT;
+            } else if (strcmp(prop, "at") == 0) {
+                b_putf(&b, "mochi_str_at(%s, %s)", o.code, args[0].code);
+            } else if (strcmp(prop, "concat") == 0) {
+                /* variadic: fold left with concat2 */
+                Buf acc; b_init(&acc); b_put(&acc, o.code);
+                for (int i = 0; i < n->nargs; i++) {
+                    Buf av; b_init(&av); co_str(em, &av, args[i]);
+                    Buf nx; b_init(&nx);
+                    b_putf(&nx, "mochi_str_concat2(%s, %s)", acc.s, av.s);
+                    free(acc.s); acc = nx; free(av.s);
+                }
+                b_putf(&b, "%s", acc.s); free(acc.s);
+            }
             else if (strcmp(prop, "indexOf") == 0) {
                 b_putf(&b, "mochi_index_of(%s, %s, %s)", o.code, args[0].code, n->nargs > 1 ? args[1].code : "0");
                 t = CT_INT;
@@ -1654,7 +1760,14 @@ EStr emit_call(Emit *em, CmcNode *n) {
             else if (strcmp(prop, "slice") == 0) b_putf(&b, "mochi_slice(%s, %s, %s)", o.code, args[0].code, n->nargs > 1 ? args[1].code : "1000000");
             else if (strcmp(prop, "repeat") == 0) b_putf(&b, "mochi_repeat(%s, %s)", o.code, args[0].code);
             else if (strcmp(prop, "replace") == 0) b_putf(&b, "mochi_replace(%s, %s, %s)", o.code, args[0].code, args[1].code);
-            else if (strcmp(prop, "split") == 0) { b_putf(&b, "mochi_split(%s, %s)", o.code, args[0].code); t = CT_ARR; }
+            else if (strcmp(prop, "split") == 0) {
+                if (n->nargs > 1) {
+                    Buf lim; b_init(&lim); co_num(em, &lim, args[1]);
+                    b_putf(&b, "mochi_split_limit(%s, %s, (int)%s)", o.code, args[0].code, lim.s);
+                    free(lim.s);
+                } else b_putf(&b, "mochi_split(%s, %s)", o.code, args[0].code);
+                t = CT_ARR;
+            }
             else if (strcmp(prop, "padStart") == 0) {
             Buf ln, fl; b_init(&ln); b_init(&fl);
             co_num(em, &ln, args[0]);
