@@ -17,6 +17,7 @@
     "src/cmochicode.c"
   ],
   "headers": [
-    "include/cmochicode.h"
+    "include/cmochicode.h",
+    "include/cmochicode_abi.h"
   ]
 }
