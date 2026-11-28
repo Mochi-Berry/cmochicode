@@ -158,6 +158,13 @@ static inline mochi_array *mochi_array_new(void) {
     a->items = (mochi_val *)CMC_ALLOC(sizeof(mochi_val) * 4);
     return a;
 }
+/* unbox a possibly-array mochi_val: NULL-safe empty array when not an array */
+static mochi_array *mochi_arr_or_empty(mochi_val v) {
+    static mochi_array *empty = NULL;
+    if (v.t == 4 && v.p) return (mochi_array *)v.p;
+    if (!empty) empty = mochi_array_new();
+    return empty;
+}
 static inline void mochi_array_push(mochi_array *a, mochi_val v) {
     if (a->len == a->cap) {
         int nc = a->cap * 2;
@@ -168,10 +175,10 @@ static inline void mochi_array_push(mochi_array *a, mochi_val v) {
     a->items[a->len++] = v;
 }
 static inline mochi_val mochi_array_get(mochi_array *a, int i) {
-    return (i >= 0 && i < a->len) ? a->items[i] : mochi_null();
+    return (i >= 0 && i < a->len) ? a->items[i] : mochi_undef();
 }
 static inline mochi_val mochi_array_pop(mochi_array *a) {
-    return a->len ? a->items[--a->len] : mochi_null();
+    return a->len ? a->items[--a->len] : mochi_undef();
 }
 static inline void mochi_array_set(mochi_array *a, int i, mochi_val v) {
     if (i >= 0 && i < a->len) a->items[i] = v;
@@ -193,6 +200,92 @@ static inline mochi_array *mochi_array_reverse(mochi_array *a) {
         mochi_val t = a->items[i]; a->items[i] = a->items[j]; a->items[j] = t;
     }
     return a;
+}
+static inline mochi_val mochi_array_shift(mochi_array *a) {
+    if (!a->len) return mochi_undef();
+    mochi_val v = a->items[0];
+    for (int i = 1; i < a->len; i++) a->items[i-1] = a->items[i];
+    a->len--; return v;
+}
+static inline void mochi_array_unshift(mochi_array *a, mochi_val v) {
+    mochi_array_push(a, mochi_null());
+    for (int i = a->len - 1; i > 0; i--) a->items[i] = a->items[i-1];
+    a->items[0] = v;
+}
+static inline int mochi_val_cmp(mochi_val a, mochi_val b) {
+    int na = (a.t == 0 || a.t == 2), nb = (b.t == 0 || b.t == 2);
+    if (na && nb) return mochi_val_num(a) < mochi_val_num(b) ? -1 : (mochi_val_num(a) > mochi_val_num(b) ? 1 : 0);
+    if (na) return -1;                 /* numbers sort before strings (JS) */
+    if (nb) return 1;
+    return strcmp(mochi_val_str(a), mochi_val_str(b));
+}
+/* JS splice: remove `del` items at `start`, insert `ins` (may be NULL),
+ * return the removed items. */
+static inline mochi_array *mochi_array_splice(mochi_array *a, int start, int del, mochi_array *ins) {
+    int n = a->len;
+    if (start < 0) start = n + start;
+    if (start < 0) start = 0;
+    if (start > n) start = n;
+    if (del < 0) del = 0;
+    if (del > n - start) del = n - start;
+    mochi_array *rem = mochi_array_new(), *r = mochi_array_new();
+    for (int i = 0; i < del; i++) mochi_array_push(rem, a->items[start + i]);
+    for (int i = 0; i < start; i++) mochi_array_push(r, a->items[i]);
+    if (ins) for (int i = 0; i < ins->len; i++) mochi_array_push(r, ins->items[i]);
+    for (int i = start + del; i < n; i++) mochi_array_push(r, a->items[i]);
+    a->items = r->items; a->len = r->len; a->cap = r->cap;
+    return rem;
+}
+static inline mochi_array *mochi_array_concat(mochi_array *a, mochi_array *b) {
+    mochi_array *r = mochi_array_new();
+    for (int i = 0; i < a->len; i++) mochi_array_push(r, a->items[i]);
+    if (b) for (int i = 0; i < b->len; i++) mochi_array_push(r, b->items[i]);
+    return r;
+}
+static inline mochi_array *mochi_array_sort(mochi_array *a) {
+    /* insertion sort: small arrays, stable, no qsort comparator context */
+    for (int i = 1; i < a->len; i++) {
+        mochi_val v = a->items[i]; int j = i - 1;
+        while (j >= 0 && mochi_val_cmp(a->items[j], v) > 0) { a->items[j+1] = a->items[j]; j--; }
+        a->items[j+1] = v;
+    }
+    return a;
+}
+static inline mochi_array *mochi_array_fill(mochi_array *a, mochi_val v, int s, int e) {
+    int n = a->len;
+    if (s < 0) s = n + s; if (s < 0) s = 0;
+    if (e < 0) e = n + e; if (e > n) e = n;
+    for (int i = s; i < e; i++) a->items[i] = v;
+    return a;
+}
+static inline mochi_val mochi_array_at(mochi_array *a, int i) {
+    if (i < 0) i += a->len;
+    return (i >= 0 && i < a->len) ? a->items[i] : mochi_undef();
+}
+static inline int mochi_array_last_index_of(mochi_array *a, double v) {
+    for (int i = a->len - 1; i >= 0; i--)
+        if (a->items[i].t == 0 && mochi_val_num(a->items[i]) == v) return i;
+    return -1;
+}
+static inline mochi_array *mochi_array_entries(mochi_array *a) {
+    mochi_array *r = mochi_array_new();
+    for (int i = 0; i < a->len; i++) {
+        mochi_array *pair = mochi_array_new();
+        mochi_array_push(pair, mochi_num((double)i));
+        mochi_array_push(pair, a->items[i]);
+        mochi_array_push(r, mochi_arr_box(pair));
+    }
+    return r;
+}
+static inline mochi_array *mochi_array_flat(mochi_array *a) {
+    mochi_array *r = mochi_array_new();
+    for (int i = 0; i < a->len; i++) {
+        if (a->items[i].t == 4 && a->items[i].p) {
+            mochi_array *in = (mochi_array *)a->items[i].p;
+            for (int j = 0; j < in->len; j++) mochi_array_push(r, in->items[j]);
+        } else mochi_array_push(r, a->items[i]);
+    }
+    return r;
 }
 static inline int mochi_array_index_of(mochi_array *a, double v) {
     for (int i = 0; i < a->len; i++)

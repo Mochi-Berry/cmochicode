@@ -277,6 +277,24 @@ void ensure_keys_helpers(Emit *em, const char *sn) {
         b_put(&g, "    for (MochiMapEntry *e = o->extra ? o->extra->head : NULL; e; e = e->next)\n"
                   "        mochi_array_push(v, e->val);\n");
     b_put(&g, "    return v;\n}\n\n");
+    /* [key, value] pairs: Object.entries(obj) */
+    b_putf(&g, "static mochi_array *%s_entries(const struct %s *o) {\n", sn, sn);
+    b_put(&g, "    mochi_array *e = mochi_array_new();\n");
+    for (int f = 0; f < 64; f++) {
+        const char *fn = cmc_struct_field_name_n(sn, f);
+        if (!fn) break;
+        Buf rhs; b_init(&rhs); b_putf(&rhs, "o->%s", fn);
+        char *bx = dk_box(cmc_struct_field_kind(sn, fn), rhs.s);
+        b_putf(&g, "    { mochi_array *pair = mochi_array_new(); mochi_array_push(pair, mochi_str(\"%s\")); "
+                   "mochi_array_push(pair, %s); mochi_array_push(e, mochi_arr_box(pair)); }\n", fn, bx);
+        free(bx); free(rhs.s);
+    }
+    if (cmc_dk_is(sn))
+        b_put(&g, "    for (MochiMapEntry *m = o->extra ? o->extra->head : NULL; m; m = m->next) {\n"
+                  "        mochi_array *pair = mochi_array_new();\n"
+                  "        mochi_array_push(pair, mochi_str(m->key)); mochi_array_push(pair, m->val);\n"
+                  "        mochi_array_push(e, mochi_arr_box(pair)); }\n");
+    b_put(&g, "    return e;\n}\n\n");
     b_put(&em->fn_extra, g.s);
     free(g.s);
 }
@@ -1374,12 +1392,18 @@ EStr emit_call(Emit *em, CmcNode *n) {
                 fprintf(stderr, "cmochi: warning: Object.assign needs two shaped objects\n");
                 return estr("0", CT_UNKNOWN, 0, 0, NULL);
             }
-            if (strcmp(prop, "keys") == 0 || strcmp(prop, "values") == 0) {
+            if (strcmp(prop, "keys") == 0 || strcmp(prop, "values") == 0 ||
+                strcmp(prop, "entries") == 0) {
                 EStr a = emit_expr(em, n->args[0]);
                 if (a.struct_name) {
                     ensure_keys_helpers(em, a.struct_name);
                     Buf kb; b_init(&kb);
                     b_putf(&kb, "%s_%s(%s)", a.struct_name, prop, a.code);
+                    return estr(kb.s, CT_ARR, 0, 1, NULL);
+                }
+                if (a.type == CT_ARR) {
+                    Buf kb; b_init(&kb);
+                    b_putf(&kb, "mochi_array_entries(%s)", a.code);
                     return estr(kb.s, CT_ARR, 0, 1, NULL);
                 }
             }
@@ -1445,6 +1469,26 @@ EStr emit_call(Emit *em, CmcNode *n) {
             emit_console(em, n->args, n->nargs, stderr_);
             return estr("0", CT_UNDEF, 0, 0, NULL);
         }
+        if (m->obj->kind == N_IDENT && strcmp(m->obj->name, "Array") == 0) {
+            if (strcmp(prop, "isArray") == 0) {
+                EStr a = emit_expr(em, n->args[0]);
+                Buf b; b_init(&b);
+                if (a.type == CT_ARR) b_put(&b, "1");
+                else if (a.type == CT_MOCHI_VAL) b_putf(&b, "((%s).t == 4)", a.code);
+                else b_put(&b, "0");
+                return estr(b.s, CT_BOOL, 0, 0, NULL);
+            }
+            if (strcmp(prop, "from") == 0) {
+                EStr a = emit_expr(em, n->args[0]);
+                if (a.type == CT_ARR) {
+                    Buf b; b_init(&b);
+                    b_putf(&b, "mochi_array_slice(%s, 0, (%s)->len)", a.code, a.code);
+                    return estr(b.s, CT_ARR, 0, 1, NULL);
+                }
+                fprintf(stderr, "cmochi: warning: Array.from over this value is unsupported\n");
+                return estr("0", CT_UNKNOWN, 0, 0, NULL);
+            }
+        }
         if (m->obj->kind == N_IDENT && strcmp(m->obj->name, "Math") == 0) {
             EStr *args = (EStr *)malloc(sizeof(EStr) * (n->nargs ? n->nargs : 1));
             for (int i = 0; i < n->nargs; i++) args[i] = emit_expr(em, n->args[i]);
@@ -1464,6 +1508,13 @@ EStr emit_call(Emit *em, CmcNode *n) {
             else b_putf(&b, "0");
             free(args);
             return estr(b.s, t, 0, 0, NULL);
+        }
+        if (o.type == CT_MOCHI_VAL) {
+            /* array boxed in a dynamic value (Object.entries()[0], map() over
+             * boxed elements, ...): unbox so the array methods still work */
+            char *ub = (char *)malloc(strlen(o.code) + 32);
+            sprintf(ub, "mochi_arr_or_empty(%s)", o.code);
+            o.code = ub; o.type = CT_ARR;
         }
         if (o.type == CT_ARR) {
             EStr *args = (EStr *)malloc(sizeof(EStr) * (n->nargs ? n->nargs : 1));
@@ -1501,9 +1552,73 @@ EStr emit_call(Emit *em, CmcNode *n) {
                 free(v.s);
                 t = CT_BOOL;
             } else if (strcmp(prop, "slice") == 0) {
-                b_putf(&b, "mochi_array_slice(%s, %s, %s)", o.code,
-                        args[0].code, (n->nargs > 1 ? args[1].code : "(int)(%s->len)"));
+                Buf stv; b_init(&stv);
+                if (n->nargs > 0) co_int(&stv, args[0]); else b_put(&stv, "0");
+                Buf endv; b_init(&endv);
+                if (n->nargs > 1) b_putf(&endv, "%s", args[1].code);
+                else b_putf(&endv, "(%s)->len", o.code);
+                b_putf(&b, "mochi_array_slice(%s, %s, %s)", o.code, stv.s, endv.s);
+                free(stv.s); free(endv.s);
                 t = CT_ARR;
+            } else if (strcmp(prop, "splice") == 0) {
+                Buf stv; b_init(&stv);
+                if (n->nargs > 0) co_int(&stv, args[0]); else b_put(&stv, "0");
+                Buf delv; b_init(&delv);
+                if (n->nargs > 1) co_int(&delv, args[1]);
+                else b_putf(&delv, "(%s)->len - (%s)", o.code, stv.s);
+                if (n->nargs > 2) {
+                    const char *ins = tmp_name(em, "ins");
+                    Buf mk; b_init(&mk);
+                    b_putf(&mk, "mochi_array *%s = mochi_array_new();", ins);
+                    e_preline(em, mk.s); free(mk.s);
+                    for (int i = 2; i < n->nargs; i++) {
+                        Buf v; b_init(&v); co_box(&v, args[i]);
+                        Buf push; b_init(&push);
+                        b_putf(&push, "mochi_array_push(%s, %s);", ins, v.s);
+                        e_preline(em, push.s); free(push.s); free(v.s);
+                    }
+                    b_putf(&b, "mochi_array_splice(%s, %s, %s, %s)", o.code, stv.s, delv.s, ins);
+                } else {
+                    b_putf(&b, "mochi_array_splice(%s, %s, %s, NULL)", o.code, stv.s, delv.s);
+                }
+                free(stv.s); free(delv.s);
+                t = CT_ARR;
+            } else if (strcmp(prop, "shift") == 0) {
+                b_putf(&b, "mochi_array_shift(%s)", o.code);
+                t = CT_MOCHI_VAL;
+            } else if (strcmp(prop, "unshift") == 0 && n->nargs == 1) {
+                Buf v; b_init(&v); co_box(&v, args[0]);
+                b_putf(&b, "mochi_array_unshift(%s, %s)", o.code, v.s);
+                free(v.s);
+                t = CT_ARR;
+            } else if (strcmp(prop, "concat") == 0) {
+                b_putf(&b, "mochi_array_concat(%s, %s)", o.code, args[0].code);
+                t = CT_ARR;
+            } else if (strcmp(prop, "sort") == 0) {
+                b_putf(&b, "mochi_array_sort(%s)", o.code);
+                t = CT_ARR;
+            } else if (strcmp(prop, "fill") == 0) {
+                Buf v; b_init(&v); co_box(&v, args[0]);
+                Buf st; b_init(&st);
+                if (n->nargs > 1) { co_int(&st, args[1]); } else b_put(&st, "0");
+                Buf en; b_init(&en);
+                if (n->nargs > 2) { co_int(&en, args[2]); } else b_putf(&en, "(%s)->len", o.code);
+                b_putf(&b, "mochi_array_fill(%s, %s, %s, %s)", o.code, v.s, st.s, en.s);
+                free(v.s); free(st.s); free(en.s);
+                t = CT_ARR;
+            } else if (strcmp(prop, "at") == 0) {
+                Buf i; b_init(&i); co_int(&i, args[0]);
+                b_putf(&b, "mochi_array_at(%s, %s)", o.code, i.s);
+                free(i.s);
+                t = CT_MOCHI_VAL;
+            } else if (strcmp(prop, "flat") == 0) {
+                b_putf(&b, "mochi_array_flat(%s)", o.code);
+                t = CT_ARR;
+            } else if (strcmp(prop, "lastIndexOf") == 0) {
+                Buf v; b_init(&v); co_num(em, &v, args[0]);
+                b_putf(&b, "mochi_array_last_index_of(%s, %s)", o.code, v.s);
+                free(v.s);
+                t = CT_INT;
             } else if (strcmp(prop, "reverse") == 0) {
                 b_putf(&b, "mochi_array_reverse(%s)", o.code);
                 t = CT_ARR;
