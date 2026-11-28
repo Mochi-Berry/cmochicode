@@ -162,7 +162,7 @@ void append_print_arg(Emit *em, CmcNode *node, EStr e, Buf *fmt, Buf *fargs) {
                 EStr ev = emit_expr(em, node->exprs[i]);
                 if (ev.type == CT_INT) { b_put(fmt, "%d"); farg_push(fargs, ev.code); }
                 else if (ev.type == CT_INT64) { b_put(fmt, "%lld"); farg_push(fargs, ev.code); }
-                else if (ev.type == CT_DOUBLE) { b_put(fmt, "%g"); farg_push(fargs, ev.code); }
+                else if (ev.type == CT_DOUBLE) { b_put(fmt, "%s"); char t[160]; snprintf(t, sizeof t, "mochi_fmt_num_js(%s)", ev.code); farg_push(fargs, t); }
                 else if (ev.type == CT_STR) { b_put(fmt, "%s"); farg_push(fargs, ev.code); }
                 else if (ev.type == CT_MOCHI_VAL) { b_put(fmt, "%s"); char t[128]; snprintf(t, sizeof t, "mochi_val_str(%s)", ev.code); farg_push(fargs, t); }
                 else if (ev.type == CT_BOOL) { b_put(fmt, "%s"); char t[128]; snprintf(t, sizeof t, "(%s ? \"true\" : \"false\")", ev.code); farg_push(fargs, t); }
@@ -173,7 +173,7 @@ void append_print_arg(Emit *em, CmcNode *node, EStr e, Buf *fmt, Buf *fargs) {
     }
     if (e.type == CT_INT) { b_put(fmt, "%d"); farg_push(fargs, e.code); }
     else if (e.type == CT_INT64) { b_put(fmt, "%lld"); farg_push(fargs, e.code); }
-    else if (e.type == CT_DOUBLE) { b_put(fmt, "%g"); farg_push(fargs, e.code); }
+    else if (e.type == CT_DOUBLE) { b_put(fmt, "%s"); char t[160]; snprintf(t, sizeof t, "mochi_fmt_num_js(%s)", e.code); farg_push(fargs, t); }
     else if (e.type == CT_STR) { b_put(fmt, "%s"); farg_push(fargs, e.code); }
     else if (e.type == CT_BOOL) { b_put(fmt, "%s"); char t[128]; snprintf(t, sizeof t, "(%s ? \"true\" : \"false\")", e.code); farg_push(fargs, t); }
     else if (e.type == CT_MOCHI_VAL) { b_put(fmt, "%s"); char t[128]; snprintf(t, sizeof t, "mochi_val_str(%s)", e.code); farg_push(fargs, t); }

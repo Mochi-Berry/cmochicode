@@ -21,7 +21,7 @@ typedef struct {
     Buf       fn_extra;
     Buf       pre;
     int       indent;
-    int       need_math, need_string, need_stdint;
+    int       need_math, need_string, need_stdint, need_ffi;
     int       tmp, fnid;
     CmcNode  *cur_fn;
     const char *u_names[128];
@@ -83,6 +83,7 @@ void member_base(Emit *em, Buf *b, EStr o);
 void num_lit(Buf *b, double v);
 void farg_push(Buf *fargs, const char *code);
 void append_print_arg(Emit *em, CmcNode *node, EStr e, Buf *fmt, Buf *fargs);
+CmcType     cmc_expr_elem_type(Emit *em, CmcNode *n);
 int expr_has_side_effect(CmcNode *n);
 const char *kfold(Emit *em, CmcNode *n);      /* fold expr -> const string, or NULL */
 void collect_cstr(Emit *em, CmcNode *n);      /* pre-pass: collect const string bindings */
@@ -137,5 +138,14 @@ const char *ref_cell_for(Emit *em, const char *name);
 CmcType infer_param_type_lite(Emit *em, CmcNode *fn, const char *pname);
 void emit_function(Emit *em, CmcNode *fn);
 char *cmc_emit(CmcCtx *ctx, CmcNode *program);
+void cmc_ffi_emit_decl(Emit *em, const char *cname, const char *sig);
+void cmc_ffi_emit_bind_stmts(Emit *em, Buf *out, const char *cname,
+                             const char *file, const char *sym);
+void cmc_ffi_emit_value(Emit *em, Buf *b, CmcType t, EStr e);
+void cmc_ffi_emit_args(Emit *em, Buf *b, const char *sig,
+                       EStr *eargs, int nargs);
+void cmc_ffi_emit_var_decl(Emit *em, const char *cname, CmcType t);
+void cmc_ffi_emit_var_bind_stmts(Emit *em, Buf *out, const char *cname,
+                                 const char *file, const char *sym, CmcType t);
 
 #endif /* CMC_EMIT_INTERNAL_H */

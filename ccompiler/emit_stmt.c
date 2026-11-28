@@ -194,6 +194,26 @@ void emit_var_decl(Emit *em, CmcNode *n) {
             else e_linef(em, "double %s = 0;", name);
             continue;
         }
+        if (d->rhs->kind == N_CALL && d->rhs->obj && d->rhs->obj->kind == N_IDENT &&
+            d->rhs->obj->name && strcmp(d->rhs->obj->name, "ffi") == 0 &&
+            d->rhs->nargs >= 3 && d->rhs->args[0]->kind == N_STR &&
+            d->rhs->args[1]->kind == N_STR && d->rhs->args[2]->kind == N_STR) {
+            const char *file = d->rhs->args[0]->str;
+            const char *symnm = d->rhs->args[1]->str;
+            const char *sig = d->rhs->args[2]->str;
+            CmcType rt, at[16]; int na = 0;
+            cmc_ffi_parse_sig(sig, &rt, at, 16, &na);
+            CmcSym *fs = cmc_env_decl(&em->env, name, rt, SYM_FUNC);
+            fs->native_file = cmc_arena_strndup(em->ctx->arena, file, strlen(file));
+            fs->native_sym = cmc_arena_strndup(em->ctx->arena, symnm, strlen(symnm));
+            fs->native_sig = cmc_arena_strndup(em->ctx->arena, sig, strlen(sig));
+            cmc_ffi_emit_decl(em, fs->cname, sig);
+            Buf st; b_init(&st);
+            cmc_ffi_emit_bind_stmts(em, &st, fs->cname, file, symnm);
+            e_linef(em, "%s", st.s);
+            free(st.s);
+            continue;
+        }
         EStr e = emit_expr(em, d->rhs);
         flush_pre(em);
         if (d->rhs->kind == N_ARROW && !arrow_captures(em, d->rhs)) {
@@ -232,6 +252,10 @@ void emit_var_decl(Emit *em, CmcNode *n) {
         if (t == CT_UNKNOWN) t = CT_DOUBLE;
         CmcSym *s = cmc_env_decl(&em->env, name, t, SYM_LOCAL);
         s->struct_name = e.struct_name;
+        if (t == CT_ARR) {
+            CmcType et = cmc_expr_elem_type(em, d->rhs);
+            if (et != CT_UNKNOWN) s->elem_type = et;
+        }
         s->heap = (t == CT_OBJ || t == CT_ARR) ? 1 : 0;
         Buf r; b_init(&r);
         switch (t) {
@@ -526,7 +550,7 @@ void emit_stmt(Emit *em, CmcNode *n) {
             e_linef(em, "{");
             const char *jb = tmp_name(em, "jb");
             e_linef(em, "MochiJmpBuf %s;", jb);
-            e_linef(em, "if (setjmp(%s) == 0) {", jb);
+            e_linef(em, "if (cmc_setjmp(%s) == 0) {", jb);
             em->indent++;
             e_linef(em, "mochi_try_push(&%s);", jb);
             em->try_depth++;

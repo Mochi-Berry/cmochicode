@@ -190,6 +190,9 @@ typedef enum {
 
 const char *cmc_type_name(CmcType t);          /* C type spelling        */
 int         cmc_is_numeric(CmcType t);
+int         cmc_ffi_parse_sig(const char *sig, CmcType *ret, CmcType *args,
+                              int maxargs, int *nargs);
+int         cmc_ffi_parse_type(const char *type, CmcType *out);
 
 /* Shape registry: object literals -> concrete C structs. */
 const char *cmc_register_shape(CmcArena *arena, CmcNode *obj);
@@ -248,12 +251,16 @@ typedef struct CmcSym {
     const char *name;      /* JS identifier            */
     const char *cname;     /* C identifier (sanitized) */
     CmcType     type;
+    CmcType     elem_type; /* for CT_ARR: static type of the elements */
     CmcSymKind  kind;
     int         escapes;   /* heap-allocated, may outlive scope */
     int         heap;      /* allocated via CMC_ALLOC      */
     const char *struct_name; /* concrete struct for CT_OBJ   */
     const char *has_name;    /* bool guard `has_X` for nullish/default params */
     CmcNode    *func_node;   /* the N_ARROW/N_FUNC this sym aliases (for calls) */
+    const char *native_file;
+    const char *native_sym;
+    const char *native_sig;
 } CmcSym;
 
 typedef struct {

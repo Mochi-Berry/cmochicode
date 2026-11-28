@@ -199,7 +199,7 @@ void cmc_emit_str_helper(Emit *em, const char *sn) {
                 b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%lld\", (long long)o->%s);\n", fn);
         }
         else if (ft && strcmp(ft, "double") == 0)
-            b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%g\", o->%s);\n", fn);
+            b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%s\", mochi_fmt_num_js(o->%s));\n", fn);
         else
             b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%s\", mochi_val_str_js(o->%s));\n", fn);
     }
@@ -248,7 +248,7 @@ void cmc_emit_json_helper(Emit *em, const char *sn) {
                 b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%lld\", (long long)o->%s);\n", fn);
         }
         else if (ft && strcmp(ft, "double") == 0)
-            b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%g\", o->%s);\n", fn);
+            b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%s\", mochi_fmt_num_js(o->%s));\n", fn);
         else
             b_putf(&g, "    off += snprintf(buf + off, sizeof buf - off, \"%%s\", mochi_val_json(o->%s));\n", fn);
     }
@@ -646,6 +646,20 @@ static void emit_member_assign(Emit *em, Buf *b, EStr o, const char *prop, EStr 
     free(base.s); free(rv.s);
 }
 
+/* The static element type of an array-valued expression: from an array
+ * literal's first element, or from the symbol's recorded elem_type when the
+ * expression is a variable. This is what makes `var alias = arr` keep the
+ * element type of `arr` (a string array stays a string array). */
+CmcType cmc_expr_elem_type(Emit *em, CmcNode *n) {
+    if (!n) return CT_UNKNOWN;
+    if (n->kind == N_ARR && n->nelems > 0) return cmc_type_of(em->ctx, &em->env, n->elems[0]);
+    if (n->kind == N_IDENT) {
+        CmcSym *s = cmc_env_lookup(&em->env, n->name);
+        if (s && s->type == CT_ARR) return s->elem_type;
+    }
+    return CT_UNKNOWN;
+}
+
 EStr emit_assign(Emit *em, CmcNode *n) {
     EStr r = emit_expr(em, n->rhs);
     Buf b; b_init(&b);
@@ -684,6 +698,10 @@ EStr emit_assign(Emit *em, CmcNode *n) {
         const char *target = s ? s->cname : n->lhs->name;
         CmcType t = s ? s->type : r.type;
         if (t == CT_UNKNOWN) t = r.type;
+        if (t == CT_ARR && n->op == TK_EQ && s) {
+            CmcType et = cmc_expr_elem_type(em, n->rhs);
+            if (et != CT_UNKNOWN) s->elem_type = et;
+        }
         if (n->op == TK_EQ) {
             Buf rv; b_init(&rv);
             if (t == CT_STR) co_str(em, &rv, r);
@@ -840,6 +858,14 @@ EStr emit_object(Emit *em, CmcNode *n) {
         : emit_expr(em, n->props[i].value);
     /* register the base shape (spread props skipped inside register_shape) */
     const char *sn = cmc_register_shape(em->ctx->arena, n);
+    /* identifiers (e.g. typed function params) are unknown at shape-registration
+     * time; widen fields now that their real types are available. */
+    for (int i = 0; i < np; i++) {
+        if (!n->props[i].key || n->props[i].spread) continue;
+        CmcType vt = vals[i].type;
+        if (vt != CT_UNKNOWN && vt != CT_VOID)
+            cmc_shape_widen_field(sn, n->props[i].key, vt);
+    }
     /* merge spread sources' fields into the shape, in prop order */
     for (int i = 0; i < np; i++) {
         CmcProp *pr = &n->props[i];
@@ -1428,6 +1454,35 @@ EStr emit_arr_higher(Emit *em, CmcNode *n, const char *prop, EStr o) {
     const char *pname2 = (np > 1 && fn->params[1]->kind == N_IDENT) ? fn->params[1]->name : NULL;
     if (strcmp(prop, "reduce") == 0 && !pname2) return estr("0", CT_INT, 0, 0, NULL);
 
+    /* the callback's first element comes from the receiver array, not from a
+     * numeric default: string/object arrays must keep their element type. */
+    CmcType et = CT_DOUBLE;
+    CmcNode *arrn = (n->obj && n->obj->kind == N_MEMBER) ? n->obj->obj : NULL;
+    if (arrn && arrn->kind == N_ARR && arrn->nelems > 0)
+        et = cmc_type_of(em->ctx, &em->env, arrn->elems[0]);
+    else if (arrn && arrn->kind == N_IDENT) {
+        CmcSym *as = cmc_env_lookup(&em->env, arrn->name);
+        if (as && as->elem_type != CT_UNKNOWN) et = as->elem_type;
+    }
+    if (et == CT_UNKNOWN || et == CT_VOID || et == CT_NULL || et == CT_UNDEF) et = CT_DOUBLE;
+    Buf elem_init; b_init(&elem_init);
+    b_put(&elem_init, "%s    ");
+    if (et == CT_STR)
+        b_put(&elem_init, "const char *%s = mochi_str_or_empty((%s)->items[%s]);\n");
+    else if (et == CT_MOCHI_VAL)
+        b_put(&elem_init, "mochi_val %s = (%s)->items[%s];\n");
+    else if (et == CT_INT)
+        /* the C type MUST match the symbol type: the printer picks %d/%lld/%g
+         * from the symbol type, and printf with a mismatched vararg type is
+         * undefined behaviour (a double read as int prints garbage/0). */
+        b_put(&elem_init, "int %s = (int)mochi_val_num((%s)->items[%s]);\n");
+    else if (et == CT_INT64)
+        b_put(&elem_init, "int64_t %s = (int64_t)mochi_val_num((%s)->items[%s]);\n");
+    else if (et == CT_BOOL)
+        b_put(&elem_init, "int %s = mochi_val_bool((%s)->items[%s]);\n");
+    else
+        b_put(&elem_init, "double %s = mochi_val_num((%s)->items[%s]);\n");
+
     char li[32]; snprintf(li, sizeof li, "__i%d", em->tmp); em->tmp++;
     char ind[16]; for (int i = 0; i < em->indent; i++) ind[i] = ' '; ind[em->indent] = 0;
     Buf out_loop; b_init(&out_loop);
@@ -1435,15 +1490,17 @@ EStr emit_arr_higher(Emit *em, CmcNode *n, const char *prop, EStr o) {
     int result_is_bool = 0;
 
     cmc_env_push(&em->env, em->ctx->arena);
-    cmc_env_decl(&em->env, pname, CT_DOUBLE, SYM_LOCAL);
-    if (pname2) cmc_env_decl(&em->env, pname2, CT_DOUBLE, SYM_LOCAL);
+    cmc_env_decl(&em->env, pname, (strcmp(prop, "reduce") == 0) ? CT_DOUBLE : et, SYM_LOCAL);
+    if (pname2) cmc_env_decl(&em->env, pname2, et, SYM_LOCAL);
 
     CmcNode *body_node = fn->body;
+    if (body_node && body_node->kind == N_BLOCK && body_node->nstmts == 1)
+        body_node = body_node->stmts[0];
     if (body_node && body_node->kind == N_EXPRSTMT && body_node->lhs) body_node = body_node->lhs;
 
     if (strcmp(prop, "forEach") == 0) {
         b_putf(&out_loop, "%sfor (size_t %s = 0; %s < (%s)->len; %s++) {\n", ind, li, li, o.code, li);
-        b_putf(&out_loop, "%s    double %s = mochi_val_num((%s)->items[%s]);\n", ind, pname, o.code, li);
+        b_putf(&out_loop, elem_init.s, ind, pname, o.code, li);
         Buf bodys; b_init(&bodys);
         if (body_node) {
             Buf saved = em->out; em->out = bodys;
@@ -1458,7 +1515,7 @@ EStr emit_arr_higher(Emit *em, CmcNode *n, const char *prop, EStr o) {
         char res[32]; snprintf(res, sizeof res, "__r%d", em->tmp); em->tmp++;
         b_putf(&out_loop, "%sdouble %s = %s;\n", ind, res, (strcmp(prop, "every") == 0) ? "1" : "0");
         b_putf(&out_loop, "%sfor (size_t %s = 0; %s < (%s)->len; %s++) {\n", ind, li, li, o.code, li);
-        b_putf(&out_loop, "%s    double %s = mochi_val_num((%s)->items[%s]);\n", ind, pname, o.code, li);
+        b_putf(&out_loop, elem_init.s, ind, pname, o.code, li);
         Buf bodyc; b_init(&bodyc);
         if (body_node) {
             Buf saved = em->out; em->out = bodyc;
@@ -1483,12 +1540,12 @@ EStr emit_arr_higher(Emit *em, CmcNode *n, const char *prop, EStr o) {
         if (strcmp(prop, "map") == 0 || strcmp(prop, "filter") == 0) {
             b_putf(&out_loop, "%smochi_array *%s = mochi_array_new();\n", ind, outv);
             b_putf(&out_loop, "%sfor (size_t %s = 0; %s < (%s)->len; %s++) {\n", ind, li, li, o.code, li);
-            b_putf(&out_loop, "%s    double %s = mochi_val_num((%s)->items[%s]);\n", ind, pname, o.code, li);
+            b_putf(&out_loop, elem_init.s, ind, pname, o.code, li);
         } else {
             b_putf(&out_loop, "%sdouble %s = 0;\n", ind, acc);
             b_putf(&out_loop, "%sfor (size_t %s = 0; %s < (%s)->len; %s++) {\n", ind, li, li, o.code, li);
             b_putf(&out_loop, "%s    double %s = %s;\n", ind, pname, acc);
-            b_putf(&out_loop, "%s    double %s = mochi_val_num((%s)->items[%s]);\n", ind, pname2, o.code, li);
+            b_putf(&out_loop, elem_init.s, ind, pname2, o.code, li);
         }
         Buf bodyc; b_init(&bodyc);
         CmcType btype = CT_UNKNOWN;
@@ -1516,6 +1573,7 @@ EStr emit_arr_higher(Emit *em, CmcNode *n, const char *prop, EStr o) {
         else
             result_name = cmc_arena_strndup(em->ctx->arena, acc, strlen(acc));
     }
+    free(elem_init.s);
     cmc_env_pop(&em->env);
     /* the loop is a statement: push to pre-lines so it precedes the current stmt */
     b_put(&em->pre, out_loop.s);
@@ -1674,6 +1732,29 @@ EStr emit_stored_fn_call(Emit *em, CmcNode *n, EStr o) {
 EStr emit_call(Emit *em, CmcNode *n) {
     CmcNode *callee = n->obj;
     if (n->is_new) return emit_new(em, n); /* `new Ctor(...)` */
+    if (callee->kind == N_CALL && callee->obj && callee->obj->kind == N_IDENT &&
+        callee->obj->name && strcmp(callee->obj->name, "ffi") == 0 &&
+        callee->nargs >= 3 && callee->args[0]->kind == N_STR &&
+        callee->args[1]->kind == N_STR && callee->args[2]->kind == N_STR) {
+        const char *file = callee->args[0]->str;
+        const char *sym = callee->args[1]->str;
+        const char *sig = callee->args[2]->str;
+        CmcType rt, at[16]; int na = 0;
+        cmc_ffi_parse_sig(sig, &rt, at, 16, &na);
+        const char *fn = tmp_name(em, "nat");
+        cmc_ffi_emit_decl(em, fn, sig);
+        Buf st; b_init(&st);
+        cmc_ffi_emit_bind_stmts(em, &st, fn, file, sym);
+        e_preline(em, st.s); free(st.s);
+        EStr *args = (EStr *)malloc(sizeof(EStr) * (n->nargs ? n->nargs : 1));
+        for (int i = 0; i < n->nargs; i++) args[i] = emit_expr(em, n->args[i]);
+        Buf b; b_init(&b);
+        b_putf(&b, "%s(", fn);
+        cmc_ffi_emit_args(em, &b, sig, args, n->nargs);
+        b_put(&b, ")");
+        free(args);
+        return estr(b.s, rt, 0, rt == CT_STR ? 1 : 0, NULL);
+    }
     /* the callee is itself a call returning a boxed function: (f())() */
     if (callee->kind == N_CALL) {
         EStr fnv = emit_call(em, callee);
@@ -1700,10 +1781,80 @@ EStr emit_call(Emit *em, CmcNode *n) {
         else if (strcmp(nm, "String") == 0) { co_str(em, &b, args[0]); t = CT_STR; }
         else if (strcmp(nm, "Boolean") == 0) { co_bool(em, &b, args[0]); t = CT_BOOL; }
         else if (strcmp(nm, "isNaN") == 0) { Buf c; b_init(&c); co_num(em, &c, args[0]); b_putf(&b, "isnan(%s)", c.s); free(c.s); t = CT_BOOL; }
+        else if (strcmp(nm, "callOnce") == 0 && n->nargs >= 3 &&
+                 n->args[0]->kind == N_STR && n->args[1]->kind == N_STR &&
+                 n->args[2]->kind == N_STR) {
+            const char *file = n->args[0]->str;
+            const char *sym = n->args[1]->str;
+            const char *sig = n->args[2]->str;
+            CmcType rt, at[16]; int na = 0;
+            cmc_ffi_parse_sig(sig, &rt, at, 16, &na);
+            const char *fn = tmp_name(em, "nat");
+            cmc_ffi_emit_decl(em, fn, sig);
+            Buf st; b_init(&st);
+            cmc_ffi_emit_bind_stmts(em, &st, fn, file, sym);
+            e_preline(em, st.s); free(st.s);
+            b_putf(&b, "%s(", fn);
+            cmc_ffi_emit_args(em, &b, sig, args + 3, n->nargs - 3);
+            b_put(&b, ")");
+            t = rt;
+        }
+        else if (strcmp(nm, "ffi") == 0 && n->nargs >= 3 &&
+                 n->args[0]->kind == N_STR && n->args[1]->kind == N_STR &&
+                 n->args[2]->kind == N_STR) {
+            const char *fn = tmp_name(em, "nat");
+            cmc_ffi_emit_decl(em, fn, n->args[2]->str);
+            Buf st; b_init(&st);
+            cmc_ffi_emit_bind_stmts(em, &st, fn, n->args[0]->str, n->args[1]->str);
+            e_preline(em, st.s); free(st.s);
+            b_putf(&b, "%s", fn);
+            t = CT_STR;
+        }
+        else if (strcmp(nm, "ffiGet") == 0 && n->nargs >= 3 &&
+                 n->args[0]->kind == N_STR && n->args[1]->kind == N_STR &&
+                 n->args[2]->kind == N_STR) {
+            CmcType vt = CT_INT;
+            cmc_ffi_parse_type(n->args[2]->str, &vt);
+            const char *vp = tmp_name(em, "natvar");
+            cmc_ffi_emit_var_decl(em, vp, vt);
+            Buf st; b_init(&st);
+            cmc_ffi_emit_var_bind_stmts(em, &st, vp, n->args[0]->str,
+                                        n->args[1]->str, vt);
+            e_preline(em, st.s); free(st.s);
+            b_putf(&b, "(*%s)", vp);
+            t = vt;
+        }
+        else if (strcmp(nm, "ffiSet") == 0 && n->nargs >= 4 &&
+                 n->args[0]->kind == N_STR && n->args[1]->kind == N_STR &&
+                 n->args[2]->kind == N_STR) {
+            CmcType vt = CT_INT;
+            cmc_ffi_parse_type(n->args[2]->str, &vt);
+            const char *vp = tmp_name(em, "natvar");
+            cmc_ffi_emit_var_decl(em, vp, vt);
+            Buf st; b_init(&st);
+            cmc_ffi_emit_var_bind_stmts(em, &st, vp, n->args[0]->str,
+                                        n->args[1]->str, vt);
+            e_preline(em, st.s); free(st.s);
+            Buf val; b_init(&val);
+            cmc_ffi_emit_value(em, &val, vt, args[3]);
+            Buf as; b_init(&as);
+            b_putf(&as, "*%s = %s;", vp, val.s);
+            e_preline(em, as.s);
+            free(as.s); free(val.s);
+            b_putf(&b, "(*%s)", vp);
+            t = vt;
+        }
 
         else {
             CmcSym *s = cmc_env_lookup(&em->env, nm);
-            if (s && s->kind == SYM_FUNC) {
+            if (s && s->native_sig) {
+                CmcType rt, at[16]; int na = 0;
+                cmc_ffi_parse_sig(s->native_sig, &rt, at, 16, &na);
+                b_putf(&b, "%s(", s->cname);
+                cmc_ffi_emit_args(em, &b, s->native_sig, args, n->nargs);
+                b_put(&b, ")");
+                t = rt;
+            } else if (s && s->kind == SYM_FUNC) {
                 b_putf(&b, "%s(", s->cname);
                 CmcNode *fn = s->func_node;
                 /* dynamic-arity call: materialize all args into a mochi_array */
@@ -1764,23 +1915,30 @@ EStr emit_call(Emit *em, CmcNode *n) {
                             const char *psh2 = (fn && i < fn->nparams && fn->params[i] && fn->params[i]->kind == N_IDENT)
                                 ? cmc_param_shape(fn->fname, fn->params[i]->name) : NULL;
                             CmcType pt2 = CT_DOUBLE;
-                            if (fn && i < fn->nparams && fn->params[i] && fn->params[i]->kind == N_IDENT)
+                            if (fn && i < fn->nparams && fn->params[i] && fn->params[i]->kind == N_IDENT) {
                                 pt2 = infer_param_type_lite(em, fn, fn->params[i]->name);
+                                CmcType ct2 = cmc_param_type(fn->fname, fn->params[i]->name);
+                                if (ct2 != CT_UNKNOWN) pt2 = ct2;
+                            }
                             if (pt2 == CT_MOCHI_VAL) {
                                 if (args[i].type == CT_MOCHI_VAL) b_put(&b, args[i].code);
                                 else { Buf bx; b_init(&bx); co_box(&bx, args[i]); b_put(&b, bx.s); free(bx.s); }
                             }
-                            else if (psh2) b_putf(&b, "%s", args[i].code);
-                            else if (args[i].type == CT_STR) co_str(em, &b, args[i]);
+                            else if (psh2 || pt2 == CT_ARR) b_putf(&b, "%s", args[i].code);
+                            else if (pt2 == CT_STR) co_str(em, &b, args[i]);
+                            else if (pt2 == CT_BOOL) co_bool(em, &b, args[i]);
                             else co_num(em, &b, args[i]);
                         } else b_put(&b, "0");
                     }
                 }
-                /* record call-site object shapes for polymorphic params */
+                /* record call-site types so later passes type params from use */
                 if (fn) for (int i = 0; i < n->nargs && i < fn->nparams; i++) {
-                    if (args[i].type == CT_OBJ && args[i].struct_name &&
-                        fn->params[i] && fn->params[i]->kind == N_IDENT)
+                    if (n->args[i]->is_spread) continue; /* `f(...xs)` passes elements, not xs */
+                    if (!fn->params[i] || fn->params[i]->kind != N_IDENT) continue;
+                    if (args[i].type == CT_OBJ && args[i].struct_name)
                         cmc_record_param_shape(fn->fname, fn->params[i]->name, args[i].struct_name);
+                    else
+                        cmc_record_param_type(fn->fname, fn->params[i]->name, args[i].type);
                 }
                 b_put(&b, ")");
                 t = s->type;
@@ -1817,6 +1975,15 @@ EStr emit_call(Emit *em, CmcNode *n) {
         if (m->computed || !m->prop || !m->prop->name) {
             EStr elem = emit_member(em, m);
             return emit_stored_fn_call(em, n, elem);
+        }
+        /* inline higher-order array methods BEFORE the callback arrow is
+         * emitted as a standalone boxed function with default int params. */
+        if (o.type == CT_ARR && n->nargs >= 1 && n->args[0]->kind == N_ARROW &&
+            (strcmp(prop, "map") == 0 || strcmp(prop, "filter") == 0 ||
+             strcmp(prop, "reduce") == 0 || strcmp(prop, "forEach") == 0 ||
+             strcmp(prop, "some") == 0 || strcmp(prop, "every") == 0 ||
+             strcmp(prop, "find") == 0)) {
+            return emit_arr_higher(em, n, prop, o);
         }
         if (m->obj && m->obj->kind == N_IDENT && m->obj->name &&
                 strcmp(m->obj->name, "JSON") == 0 && strcmp(prop, "stringify") == 0 &&
@@ -2463,7 +2630,8 @@ void emit_function(Emit *em, CmcNode *fn) {
     for (int i = 0; i < fn->nparams; i++) {
         if (fn->params[i]->kind == N_IDENT) {
             const char *psh = cmc_param_shape(fn->fname, fn->params[i]->name);
-            pt[i] = psh ? CT_OBJ : infer_param_type_lite(em, fn, fn->params[i]->name);
+            CmcType ct = cmc_param_type(fn->fname, fn->params[i]->name);
+            pt[i] = psh ? CT_OBJ : (ct != CT_UNKNOWN ? ct : infer_param_type_lite(em, fn, fn->params[i]->name));
         } else pt[i] = CT_DOUBLE;
     }
     vol_pass(em, fn->body);

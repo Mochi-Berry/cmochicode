@@ -362,6 +362,14 @@ void cmc_record_param_type(const char *fn, const char *param, CmcType t) {
     for (int i = 0; i < g_param_shapes_n; i++)
         if (strcmp(g_param_shapes[i].fn, fn) == 0 && strcmp(g_param_shapes[i].param, param) == 0) {
             CmcType old = g_param_shapes[i].type;
+            /* a recursive call with an as-yet-unresolved arg must not poison a
+             * concrete type already learned from a real call site */
+            if (t == CT_MOCHI_VAL && old != CT_UNKNOWN && old != CT_MOCHI_VAL) return;
+            /* JS has one number type: int/double call sites agree on double */
+            if (cmc_is_numeric(old) && cmc_is_numeric(t)) {
+                g_param_shapes[i].type = CT_DOUBLE;
+                return;
+            }
             g_param_shapes[i].type = (old == CT_UNKNOWN || old == t) ? t : CT_MOCHI_VAL;
             return;
         }
@@ -390,6 +398,8 @@ void cmc_shape_widen_field(const char *struct_name, const char *field, CmcType t
         if (strcmp(g_shapes.shapes[i].name, struct_name) != 0) continue;
         for (int j = 0; j < g_shapes.shapes[i].nfields; j++)
             if (strcmp(g_shapes.shapes[i].field_names[j], field) == 0) {
+                CmcType cur = g_shapes.shapes[i].field_types[j];
+                if (cur == CT_MOCHI_VAL && t != CT_MOCHI_VAL) return; /* never downgrade a dynamic field */
                 g_shapes.shapes[i].field_types[j] = t;
                 return;
             }
@@ -495,6 +505,15 @@ CmcType cmc_type_of(CmcCtx *ctx, CmcEnv *env, CmcNode *n) {
                     strcmp(nm, "isFinite") == 0) return CT_DOUBLE;
                 if (strcmp(nm, "String") == 0) return CT_STR;
                 if (strcmp(nm, "Boolean") == 0) return CT_BOOL;
+                if (n->nargs >= 3 && n->args[2] && n->args[2]->kind == N_STR) {
+                    CmcType ret, at[16]; int na = 0;
+                    if ((strcmp(nm, "ffi") == 0 || strcmp(nm, "callOnce") == 0) &&
+                        cmc_ffi_parse_sig(n->args[2]->str, &ret, at, 16, &na))
+                        return ret == CT_VOID ? CT_INT : ret;
+                    if ((strcmp(nm, "ffiGet") == 0 || strcmp(nm, "ffiSet") == 0) &&
+                        cmc_ffi_parse_type(n->args[2]->str, &ret))
+                        return ret;
+                }
                 CmcSym *s = cmc_env_lookup(env, nm);
                 if (s && s->kind == SYM_FUNC) return s->type;
                 /* a variable/param used as a callee is a boxed callable */

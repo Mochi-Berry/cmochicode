@@ -41,6 +41,21 @@
  * copied into a static buffer so it survives the unwind (the throwing frame
  * is gone). Uncaught throws print and exit. */
 typedef jmp_buf MochiJmpBuf;   /* jmp_buf is an array type; keep it as one */
+/* The jump primitives. MSVCRT's longjmp() UNWINDS (RtlUnwindEx) on the way to
+ * the target frame, and that unwind crashes on x64 whenever the target frame
+ * was reached through inlined code - the inlined frame's unwind records do not
+ * describe the real stack, so RtlVirtualUnwind walks into garbage (observed:
+ * a SIGSEGV inside ntdll!RtlVirtualUnwind, non-deterministic per ASLR run).
+ * Plain C has no destructors and no SEH handlers to run, so unwinding is pure
+ * cost: __builtin_longjmp() jumps straight to the saved context with no unwind
+ * at all. Verified: 12/12 deterministic runs instead of ~2/12. */
+#if defined(__GNUC__) && (!defined(__clang__) || __has_builtin(__builtin_longjmp))
+#define cmc_setjmp(jb)  __builtin_setjmp((jb))
+#define mochi_longjmp(jb) __builtin_longjmp((void *)(jb), 1)
+#else
+#define cmc_setjmp(jb)  setjmp((jb))
+#define mochi_longjmp(jb) longjmp((jb), 1)
+#endif
 #define MOCHI_TRY_MAX 32
 static MochiJmpBuf *mochi_try_stack[MOCHI_TRY_MAX];
 static int mochi_try_depth = 0;
@@ -60,7 +75,7 @@ static void mochi_throw(const char *msg) {
     mochi_last_thrown = mochi_thrown_buf;
     if (mochi_try_depth > 0) {
         MochiJmpBuf *target = mochi_try_stack[mochi_try_depth - 1];
-        longjmp(*target, 1);
+        mochi_longjmp(*target);
     }
     fprintf(stderr, "Exception: %s\n", mochi_thrown_buf);
     exit(1);
@@ -162,6 +177,28 @@ static inline const char *mochi_val_json(mochi_val v){
     return mochi_val_str(v);
 }
 static inline const char *mochi_val_str(mochi_val v);
+/* JS-compatible number formatting (Number.prototype.toString):
+ * integers print in full decimal (1000000, not 1e+06), non-integers use the
+ * shortest representation that round-trips (0.1 stays "0.1"), and the
+ * non-finite values use the JS spellings. */
+static inline const char *mochi_fmt_num_js(double v) {
+    static char b[4][40]; static int bi = 0; bi = (bi + 1) & 3;
+    char *p = b[bi];
+    if (v != v) { snprintf(p, 40, "NaN"); return p; }
+    if (v > 1.7976931348623157e308) { snprintf(p, 40, "Infinity"); return p; }
+    if (v < -1.7976931348623157e308) { snprintf(p, 40, "-Infinity"); return p; }
+    /* range check BEFORE the cast: (long long)v is UB out of range */
+    if (v >= -9.2233720368547758e18 && v <= 9.2233720368547758e18 &&
+        v == (double)(long long)v) {
+        snprintf(p, 40, "%lld", (long long)v);
+        return p;
+    }
+    for (int prec = 15; prec <= 17; prec++) {
+        snprintf(p, 40, "%.*g", prec, v);
+        if (strtod(p, NULL) == v) break;
+    }
+    return p;
+}
 static inline const char *mochi_val_str_js(mochi_val v){
     if (v.t==1) { static char sb[4][256]; static int si=0; si=(si+1)&3;
         snprintf(sb[si],256,"'%s'", v.s); return sb[si]; }
@@ -169,7 +206,7 @@ static inline const char *mochi_val_str_js(mochi_val v){
 }
 static inline const char *mochi_val_str(mochi_val v){
     if (v.t==1) return v.s;
-    if (v.t==0) { static char b[4][32]; static int bi=0; bi=(bi+1)&3; snprintf(b[bi],32,"%g",v.n); return b[bi]; }
+    if (v.t==0) { return mochi_fmt_num_js(v.n); }
     if (v.t==2) return v.n ? "true" : "false";
     if (v.t==3) return "null";
     if (v.t==5 && v.p) {
@@ -340,7 +377,8 @@ static inline const char *mochi_array_join(mochi_array *a, const char *sep) {
     for (int i = 0; i < a->len; i++) {
         if (i) { memcpy(out + o, sep, sl); o += sl; }
         if (a->items[i].t == 1) { size_t l = strlen(a->items[i].s); memcpy(out + o, a->items[i].s, l); o += l; }
-        else o += (size_t)snprintf(out + o, need - o, "%g", a->items[i].n);
+        else { const char *ns = mochi_fmt_num_js(a->items[i].n);
+               o += (size_t)snprintf(out + o, need - o, "%s", ns); }
     }
     out[o] = 0; return out;
 }
@@ -363,7 +401,7 @@ static inline const char *mochi_array_inspect(mochi_array *a) {
         mochi_val v = a->items[i];
         if (i) off += snprintf(p + off, 4096 - off, ", ");
         if (v.t == 1) off += snprintf(p + off, 4096 - off, "'%s'", v.s);
-        else if (v.t == 0) off += snprintf(p + off, 4096 - off, "%g", v.n);
+        else if (v.t == 0) off += snprintf(p + off, 4096 - off, "%s", mochi_fmt_num_js(v.n));
         else if (v.t == 2) off += snprintf(p + off, 4096 - off, "%s", v.n ? "true" : "false");
         else if (v.t == 3) off += snprintf(p + off, 4096 - off, "null");
         else off += snprintf(p + off, 4096 - off, "...");
@@ -379,8 +417,9 @@ static inline const char *mochi_concat(const char *a, const char *b) {
     memcpy(o, a, la); memcpy(o + la, b, lb + 1); return o;
 }
 static inline const char *mochi_num_to_str(double v) {
-    char buf[64]; int l = snprintf(buf, 64, "%g", v);
-    char *o = (char *)CMC_ALLOC(l + 1); memcpy(o, buf, l + 1); return o;
+    const char *src = mochi_fmt_num_js(v);
+    size_t l = strlen(src);
+    char *o = (char *)CMC_ALLOC(l + 1); memcpy(o, src, l + 1); return o;
 }
 static inline const char *mochi_toupper(const char *s) {
     size_t l = strlen(s); char *o = (char *)CMC_ALLOC(l + 1);

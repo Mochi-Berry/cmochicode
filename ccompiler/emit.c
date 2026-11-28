@@ -116,7 +116,9 @@ char *cmc_emit(CmcCtx *ctx, CmcNode *program) {
     b_put(&out, "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n");
     if (em.need_stdint) b_put(&out, "#include <stdint.h>\n");
     if (em.need_math) b_put(&out, "#include <math.h>\n");
-    b_put(&out, "#include \"cmochicode_rt.h\"\n\n");
+    b_put(&out, "#include \"cmochicode_rt.h\"\n");
+    if (em.need_ffi) b_put(&out, "#include \"cmochi_ffi.h\"\n");
+    b_put(&out, "\n");
     /* emit concrete struct definitions for every registered object shape */
     for (int si = 0; si < cmc_shape_count(); si++) {
         const char *sn = cmc_shape_name(si);
