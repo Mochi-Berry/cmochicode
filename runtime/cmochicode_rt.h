@@ -156,7 +156,10 @@ static inline mochi_val mochi_null(void)         { mochi_val x; x.t=3; x.n=0; x.
 static inline mochi_val mochi_undef(void)        { mochi_val x; x.t=6; x.n=0; x.s=0; x.p=0; return x; }
 static inline mochi_val mochi_arr_box(mochi_array *a){ mochi_val x; x.t=4; x.n=0; x.s=0; x.p=a; return x; }
 static inline mochi_val mochi_obj_box(void *o)   { mochi_val x; x.t=5; x.n=0; x.s=0; x.p=o; return x; }
-static inline double mochi_val_num(mochi_val v)  { return v.t==1 ? atof(v.s) : v.n; }
+static inline double mochi_val_num(mochi_val v)  {
+    if (v.t == 6) return NAN;      /* undefined in arithmetic is NaN (JS); null stays 0 */
+    return v.t==1 ? atof(v.s) : v.n;
+}
 /* JS-style value repr: strings get quotes, numbers/bools/null as-is —
  * matches how node prints an object value. */
 /* JSON rendering of a dynamic value: strings are quoted and escaped,

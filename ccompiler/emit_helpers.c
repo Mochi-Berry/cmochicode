@@ -75,6 +75,8 @@ void co_num(Emit *em, Buf *b, EStr e) {
     if (e.type == CT_MOCHI_VAL) b_putf(b, "mochi_val_num(%s)", e.code);
     else if (e.type == CT_STR) b_putf(b, "atof(%s)", e.code);
     else if (cmc_is_numeric(e.type)) b_put(b, e.code);
+    else if (e.type == CT_UNDEF) b_put(b, "NAN");   /* Number(undefined) = NaN */
+    else if (e.type == CT_NULL) b_put(b, "0");      /* Number(null) = 0 */
     else b_putf(b, "(double)(%s)", e.code);
 }
 
@@ -89,6 +91,8 @@ void co_str(Emit *em, Buf *b, EStr e) {
     else if (e.type == CT_MOCHI_VAL) b_putf(b, "mochi_val_str(%s)", e.code);
     else if (cmc_is_numeric(e.type)) b_putf(b, "mochi_num_to_str(%s)", e.code);
     else if (e.type == CT_BOOL) b_putf(b, "(%s ? \"true\" : \"false\")", e.code);
+    else if (e.type == CT_UNDEF) b_put(b, "\"undefined\"");   /* String(undefined) */
+    else if (e.type == CT_NULL) b_put(b, "\"null\"");       /* String(null) */
     else b_put(b, e.code);
 }
 
@@ -105,7 +109,8 @@ void co_box(Buf *b, EStr e) {
     else if (e.type == CT_STR) b_putf(b, "mochi_str(%s)", e.code);
     else if (cmc_is_numeric(e.type)) b_putf(b, "mochi_num((double)(%s))", e.code);
     else if (e.type == CT_BOOL) b_putf(b, "mochi_bool(%s)", e.code);
-    else if (e.type == CT_NULL || e.type == CT_UNDEF) b_put(b, "mochi_null()");
+    else if (e.type == CT_NULL) b_put(b, "mochi_null()");
+    else if (e.type == CT_UNDEF) b_put(b, "mochi_undef()");
     else if (e.type == CT_ARR) b_putf(b, "mochi_arr_box(%s)", e.code);
     else if (e.type == CT_OBJ) b_putf(b, "mochi_obj_box(%s)", e.code);
     else b_putf(b, "mochi_num(0)");
@@ -177,7 +182,8 @@ void append_print_arg(Emit *em, CmcNode *node, EStr e, Buf *fmt, Buf *fargs) {
     else if (e.type == CT_STR) { b_put(fmt, "%s"); farg_push(fargs, e.code); }
     else if (e.type == CT_BOOL) { b_put(fmt, "%s"); char t[128]; snprintf(t, sizeof t, "(%s ? \"true\" : \"false\")", e.code); farg_push(fargs, t); }
     else if (e.type == CT_MOCHI_VAL) { b_put(fmt, "%s"); char t[128]; snprintf(t, sizeof t, "mochi_val_str(%s)", e.code); farg_push(fargs, t); }
-    else if (e.type == CT_NULL || e.type == CT_UNDEF) { b_put(fmt, "null"); }
+    else if (e.type == CT_NULL) { b_put(fmt, "null"); }
+    else if (e.type == CT_UNDEF) { b_put(fmt, "undefined"); }
     else if (e.type == CT_ARR) {
         b_put(fmt, "%s");
         Buf j; b_init(&j);

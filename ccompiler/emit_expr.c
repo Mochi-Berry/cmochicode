@@ -1648,8 +1648,15 @@ void emit_cargs_arg(Buf *b, const char *cargs, int pos, CmcType pt) {
     else if (pt == CT_BOOL)
         b_putf(b, "((%s)->len > %d ? mochi_val_bool(mochi_array_get(%s, %d)) : 0)",
                cargs, pos, cargs, pos);
+    else if (pt == CT_MOCHI_VAL)
+        /* the element itself, no coercion; a missing one is `undefined` */
+        b_putf(b, "((%s)->len > %d ? mochi_array_get(%s, %d) : mochi_undef())",
+               cargs, pos, cargs, pos);
+    else if (pt == CT_ARR || pt == CT_OBJ)
+        b_putf(b, "((%s)->len > %d ? mochi_array_get(%s, %d).p : NULL)",
+               cargs, pos, cargs, pos);
     else
-        b_putf(b, "((%s)->len > %d ? mochi_val_num(mochi_array_get(%s, %d)) : 0)",
+        b_putf(b, "((%s)->len > %d ? mochi_val_num(mochi_array_get(%s, %d)) : NAN)",
                cargs, pos, cargs, pos);
 }
 void emit_cargs_has(Buf *b, const char *cargs, int pos) {
@@ -1892,34 +1899,36 @@ EStr emit_call(Emit *em, CmcNode *n) {
                             else if (args[i].type == CT_STR) co_str(em, &b, args[i]);
                             else co_num(em, &b, args[i]);
                         } else {
-                            /* omitted arg: not present -> has=0, value 0/NULL */
-                            b_put(&b, pt == CT_STR ? "0, NULL" : "0, 0");
+                            /* omitted arg: not present -> has=0, value undefined */
+                            if (pt == CT_STR) b_put(&b, "0, NULL");
+                            else if (pt == CT_MOCHI_VAL) b_put(&b, "0, mochi_undef()");
+                            else if (pt == CT_ARR || pt == CT_OBJ) b_put(&b, "0, NULL");
+                            else b_put(&b, "0, 0");
                         }
                     }
                 } else {
                     int np = fn && fn->nparams > 0 ? fn->nparams : n->nargs;
                     for (int i = 0; i < np; i++) {
+                        /* the parameter type decides how a MISSING argument is passed:
+                         * JS gives `undefined`, which is NaN in arithmetic. */
+                        CmcType pt2 = CT_DOUBLE;
+                        if (fn && i < fn->nparams && fn->params[i] && fn->params[i]->kind == N_IDENT) {
+                            pt2 = infer_param_type_lite(em, fn, fn->params[i]->name);
+                            CmcType ct2 = cmc_param_type(fn->fname, fn->params[i]->name);
+                            if (ct2 != CT_UNKNOWN) pt2 = ct2;
+                        }
                         if (i) b_put(&b, ", ");
-                        if (fn && fn->params[i]->is_rest) {
+                        if (fn && i < fn->nparams && fn->params[i]->is_rest) {
                             if (spread)
                                 b_putf(&b, "mochi_array_slice(%s, %d, (%s)->len)", cargs, i, cargs);
                             else
                                 b_putf(&b, "%s", build_rest_array(em, args, i, n->nargs));
                         } else if (spread) {
                             /* arity is runtime: read position i, bounds-guarded */
-                            CmcType pt = CT_DOUBLE;
-                            if (fn && i < fn->nparams && fn->params[i] && fn->params[i]->kind == N_IDENT)
-                                pt = infer_param_type_lite(em, fn, fn->params[i]->name);
-                            emit_cargs_arg(&b, cargs, i, pt);
+                            emit_cargs_arg(&b, cargs, i, pt2);
                         } else if (i < n->nargs) {
                             const char *psh2 = (fn && i < fn->nparams && fn->params[i] && fn->params[i]->kind == N_IDENT)
                                 ? cmc_param_shape(fn->fname, fn->params[i]->name) : NULL;
-                            CmcType pt2 = CT_DOUBLE;
-                            if (fn && i < fn->nparams && fn->params[i] && fn->params[i]->kind == N_IDENT) {
-                                pt2 = infer_param_type_lite(em, fn, fn->params[i]->name);
-                                CmcType ct2 = cmc_param_type(fn->fname, fn->params[i]->name);
-                                if (ct2 != CT_UNKNOWN) pt2 = ct2;
-                            }
                             if (pt2 == CT_MOCHI_VAL) {
                                 if (args[i].type == CT_MOCHI_VAL) b_put(&b, args[i].code);
                                 else { Buf bx; b_init(&bx); co_box(&bx, args[i]); b_put(&b, bx.s); free(bx.s); }
@@ -1928,7 +1937,9 @@ EStr emit_call(Emit *em, CmcNode *n) {
                             else if (pt2 == CT_STR) co_str(em, &b, args[i]);
                             else if (pt2 == CT_BOOL) co_bool(em, &b, args[i]);
                             else co_num(em, &b, args[i]);
-                        } else b_put(&b, "0");
+                        } else if (pt2 == CT_MOCHI_VAL) b_put(&b, "mochi_undef()");
+                        else if (pt2 == CT_DOUBLE) b_put(&b, "NAN");
+                        else b_put(&b, "0");
                     }
                 }
                 /* record call-site types so later passes type params from use */
