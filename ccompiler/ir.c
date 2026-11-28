@@ -329,18 +329,23 @@ void cmc_shape_flush_promotions(void) {
 /* Call-site shape inference for polymorphic object params: a function
  * parameter that receives an object at a call site gets the object's shape,
  * so `fill(q)` with q = {v:1} types fill's `q` as `struct <shape> *`. */
-typedef struct { const char *fn; const char *param; const char *sname; } CmcParamShape;
+typedef struct { const char *fn; const char *param; const char *sname; CmcType type; } CmcParamShape;
 static CmcParamShape g_param_shapes[64];
 static int g_param_shapes_n = 0;
 void cmc_param_shapes_reset(void) { g_param_shapes_n = 0; }
 void cmc_record_param_shape(const char *fn, const char *param, const char *sname) {
     if (!fn || !param || !sname) return;
     for (int i = 0; i < g_param_shapes_n; i++)
-        if (strcmp(g_param_shapes[i].fn, fn) == 0 && strcmp(g_param_shapes[i].param, param) == 0) return;
+        if (strcmp(g_param_shapes[i].fn, fn) == 0 && strcmp(g_param_shapes[i].param, param) == 0) {
+            g_param_shapes[i].sname = sname;
+            g_param_shapes[i].type = CT_OBJ;
+            return;
+        }
     if (g_param_shapes_n < 64) {
         g_param_shapes[g_param_shapes_n].fn = fn;
         g_param_shapes[g_param_shapes_n].param = param;
         g_param_shapes[g_param_shapes_n].sname = sname;
+        g_param_shapes[g_param_shapes_n].type = CT_OBJ;
         g_param_shapes_n++;
     }
 }
@@ -350,6 +355,30 @@ const char *cmc_param_shape(const char *fn, const char *param) {
         if (strcmp(g_param_shapes[i].fn, fn) == 0 && strcmp(g_param_shapes[i].param, param) == 0)
             return g_param_shapes[i].sname;
     return NULL;
+}
+void cmc_record_param_type(const char *fn, const char *param, CmcType t) {
+    if (!fn || !param || t == CT_UNKNOWN || t == CT_VOID) return;
+    if (t == CT_NULL || t == CT_UNDEF) t = CT_MOCHI_VAL;
+    for (int i = 0; i < g_param_shapes_n; i++)
+        if (strcmp(g_param_shapes[i].fn, fn) == 0 && strcmp(g_param_shapes[i].param, param) == 0) {
+            CmcType old = g_param_shapes[i].type;
+            g_param_shapes[i].type = (old == CT_UNKNOWN || old == t) ? t : CT_MOCHI_VAL;
+            return;
+        }
+    if (g_param_shapes_n < 64) {
+        g_param_shapes[g_param_shapes_n].fn = fn;
+        g_param_shapes[g_param_shapes_n].param = param;
+        g_param_shapes[g_param_shapes_n].sname = NULL;
+        g_param_shapes[g_param_shapes_n].type = t;
+        g_param_shapes_n++;
+    }
+}
+CmcType cmc_param_type(const char *fn, const char *param) {
+    if (!fn || !param) return CT_UNKNOWN;
+    for (int i = 0; i < g_param_shapes_n; i++)
+        if (strcmp(g_param_shapes[i].fn, fn) == 0 && strcmp(g_param_shapes[i].param, param) == 0)
+            return g_param_shapes[i].type;
+    return CT_UNKNOWN;
 }
 
 /* Change an existing field's type (e.g. widen int -> double, or any static

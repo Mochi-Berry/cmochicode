@@ -18,6 +18,14 @@
 #include <math.h>
 #include <stdint.h>
 #include <setjmp.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#include <time.h>
+#endif
 
 #ifdef CMC_WITH_MOCHIBERRY
 #include "mbjs_alloc.h"
@@ -603,5 +611,19 @@ static inline const char *mochi_pad_end(const char *s, int len, const char *fill
     return out;
 }
 static inline double mochi_rand01(void) { return (double)rand() / (double)RAND_MAX; }
+
+/* Date.now(): wall-clock milliseconds since the Unix epoch. */
+static inline double mochi_now_ms(void) {
+#ifdef _WIN32
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    unsigned long long ticks = ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (double)(ticks / 10000ULL) - 11644473600000.0;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#endif
+}
 
 #endif /* CMOCHICODE_RT_H */

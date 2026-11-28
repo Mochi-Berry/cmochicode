@@ -29,7 +29,10 @@ EStr emit_ident(Emit *em, CmcNode *n) {
         for (int i = 0; i < em->cur_ncapt; i++) {
             if (em->cur_capt[i] && !strcmp(em->cur_capt[i], n->name)) {
                 char cb[128];
-                snprintf(cb, sizeof cb, "((struct %s *)__env)->%s", em->cur_up, n->name);
+                if (em->cur_capt_ref[i])
+                    snprintf(cb, sizeof cb, "*((struct %s *)__env)->%s", em->cur_up, n->name);
+                else
+                    snprintf(cb, sizeof cb, "((struct %s *)__env)->%s", em->cur_up, n->name);
                 return estr(cmc_arena_strndup(em->ctx->arena, cb, strlen(cb)),
                             em->cur_capt_type[i], 0, 0, NULL);
             }
@@ -55,6 +58,7 @@ const char *fn_return_shape(Emit *em, CmcNode *fn);
 void cmc_emit_str_helper(Emit *em, const char *sn);
 void cmc_emit_json_helper(Emit *em, const char *sn);
 
+static int capt_is_ref(Emit *em, const char *name);
 static const char *capt_lvalue(Emit *em, const char *name);
 EStr emit_member_field(Emit *em, EStr o, CmcNode *obj_node, const char *prop, int optional) {
     /* function.length: params before the first default / rest — must be
@@ -649,7 +653,10 @@ EStr emit_assign(Emit *em, CmcNode *n) {
         const char *cap = capt_lvalue(em, n->lhs->name);
         if (cap) {
             char cb2[128];
-            snprintf(cb2, sizeof cb2, "((struct %s *)__env)->%s", cap, n->lhs->name);
+            if (capt_is_ref(em, n->lhs->name))
+                snprintf(cb2, sizeof cb2, "*((struct %s *)__env)->%s", cap, n->lhs->name);
+            else
+                snprintf(cb2, sizeof cb2, "((struct %s *)__env)->%s", cap, n->lhs->name);
             if (n->op == TK_EQ) {
                 b_putf(&b, "%s = ", cb2);
                 CmcType ct = CT_UNKNOWN;
@@ -757,7 +764,10 @@ EStr emit_update(Emit *em, CmcNode *n) {
         const char *capu = capt_lvalue(em, n->lhs->name);
         if (capu) {
             char cb3[128];
-            snprintf(cb3, sizeof cb3, "((struct %s *)__env)->%s", capu, n->lhs->name);
+            if (capt_is_ref(em, n->lhs->name))
+                snprintf(cb3, sizeof cb3, "*((struct %s *)__env)->%s", capu, n->lhs->name);
+            else
+                snprintf(cb3, sizeof cb3, "((struct %s *)__env)->%s", capu, n->lhs->name);
             b_putf(&b, "(%s %s= 1)", cb3, n->op > 0 ? "+" : "-");
             return estr(b.s, CT_INT, 0, 0, NULL);
         }
@@ -999,6 +1009,55 @@ static void fv_walk(CmcNode *nd, CmcFreeVar *out, int *cnt);
 static int fv_is_param(CmcNode *n, const char *name);
 static int fv_is_declared(CmcNode *body, const char *name);
 
+/* the shared cell for a by-reference captured name (NULL if snapshot) */
+const char *ref_cell_for(Emit *em, const char *name) {
+    if (!name) return NULL;
+    for (int i = 0; i < em->ref_n; i++)
+        if (em->ref_name[i] && !strcmp(em->ref_name[i], name)) return em->ref_cell[i];
+    return NULL;
+}
+
+/* does any closure in this body capture `name` from the enclosing scope? */
+int body_captures_name(Emit *em, CmcNode *body, const char *name) {
+    if (!body || !name) return 0;
+    CmcNode *stack[512]; int sp = 0; stack[sp++] = body;
+    while (sp) {
+        CmcNode *cur = stack[--sp];
+        if (!cur) continue;
+        if (cur->kind == N_ARROW || cur->kind == N_FUNC) {
+            CmcFreeVar fv[16]; int nfv = 0;
+            fv_walk(cur->body, fv, &nfv);
+            for (int i = 0; i < nfv; i++) {
+                if (!fv[i].name || strcmp(fv[i].name, name) != 0) continue;
+                if (fv_is_param(cur, name)) continue;
+                if (fv_is_declared(cur->body, name)) continue;
+                CmcSym *cs = cmc_env_lookup(&em->env, name);
+                if (cs && cs->kind != SYM_FUNC && cs->kind != SYM_GLOBAL) return 1;
+            }
+            continue; /* the arrow's own body is a separate scope */
+        }
+        if (cur->lhs) stack[sp++] = cur->lhs;
+        if (cur->rhs) stack[sp++] = cur->rhs;
+        if (cur->obj) stack[sp++] = cur->obj;
+        if (cur->prop) stack[sp++] = cur->prop;
+        if (cur->cons) stack[sp++] = cur->cons;
+        if (cur->alt) stack[sp++] = cur->alt;
+        if (cur->third) stack[sp++] = cur->third;
+        if (cur->init) stack[sp++] = cur->init;
+        if (cur->test) stack[sp++] = cur->test;
+        if (cur->update) stack[sp++] = cur->update;
+        if (cur->stmt) stack[sp++] = cur->stmt;
+        if (cur->body) stack[sp++] = cur->body;
+        if (cur->left) stack[sp++] = cur->left;
+        for (int i = 0; i < cur->nargs; i++) stack[sp++] = cur->args[i];
+        for (int i = 0; i < cur->nstmts; i++) stack[sp++] = cur->stmts[i];
+        for (int i = 0; i < cur->nelems; i++) stack[sp++] = cur->elems[i];
+        for (int i = 0; i < cur->nprops; i++) if (cur->props[i].value) stack[sp++] = cur->props[i].value;
+        for (int i = 0; i < cur->nexprs; i++) stack[sp++] = cur->exprs[i];
+    }
+    return 0;
+}
+
 int arrow_captures(Emit *em, CmcNode *arrow) {
     if (!arrow || (arrow->kind != N_ARROW && arrow->kind != N_FUNC)) return 0;
     CmcFreeVar fv[16]; int nfv = 0;
@@ -1075,6 +1134,12 @@ EStr emit_stored_fn_call(Emit *em, CmcNode *n, EStr o);
 EStr emit_call(Emit *em, CmcNode *n);
 
 /* a captured name read/written as an lvalue inside the arrow body */
+static int capt_is_ref(Emit *em, const char *name) {
+    if (!em->cur_up || em->cur_ncapt <= 0 || !name) return 0;
+    for (int i = 0; i < em->cur_ncapt; i++)
+        if (em->cur_capt[i] && !strcmp(em->cur_capt[i], name)) return em->cur_capt_ref[i];
+    return 0;
+}
 static const char *capt_lvalue(Emit *em, const char *name) {
     if (!em->cur_up || em->cur_ncapt <= 0 || !name) return NULL;
     for (int i = 0; i < em->cur_ncapt; i++)
@@ -1136,7 +1201,9 @@ EStr emit_arrow(Emit *em, CmcNode *n) {
         for (int i = 0; i < ncap; i++) fv[i] = cap[i];
     }
     const char *upstruct = NULL;
+    int capref[16];
     if (nfv > 0) {
+        for (int i = 0; i < nfv; i++) capref[i] = 0;
         upstruct = (char *)0;
         Buf us; b_init(&us);
         b_putf(&us, "struct __up_%s {\n", fnname);
@@ -1147,6 +1214,14 @@ EStr emit_arrow(Emit *em, CmcNode *n) {
             if (t == CT_STR) tn = "const char *";
             if (t == CT_OBJ) { const char *sh = cs ? cs->struct_name : NULL;
                 if (sh) { Buf tnb; b_init(&tnb); b_putf(&tnb, "struct %s *", sh); tn = cmc_arena_strndup(em->ctx->arena, tnb.s, tnb.len); free(tnb.s); } }
+            /* by-reference capture: the field holds the shared cell pointer */
+            if (ref_cell_for(em, fv[i].name)) {
+                Buf pb; b_init(&pb);
+                b_putf(&pb, "%s *", tn);
+                tn = cmc_arena_strndup(em->ctx->arena, pb.s, pb.len);
+                free(pb.s);
+                capref[i] = 1;
+            }
             b_putf(&us, "    %s %s;\n", tn, fv[i].name);
         }
         b_put(&us, "};\n");
@@ -1189,6 +1264,7 @@ EStr emit_arrow(Emit *em, CmcNode *n) {
     /* set the current function's capture set for emit_ident to rewrite */
     em->cur_up = upstruct; em->cur_ncapt = nfv;
     for (int i = 0; i < nfv; i++) { em->cur_capt[i] = fv[i].name; em->cur_capt_type[i] = fv[i].type; }
+    if (upstruct) for (int i = 0; i < nfv; i++) em->cur_capt_ref[i] = capref[i];
     e_line(em, sig.s);
     free(sig.s);
     em->indent++;
@@ -1294,6 +1370,13 @@ EStr emit_arrow(Emit *em, CmcNode *n) {
                     src = cmc_arena_strndup(em->ctx->arena, nb2, strlen(nb2));
                     break;
                 }
+            }
+            if (capref[i]) {
+                const char *rc = ref_cell_for(em, fv[i].name);
+                Buf pp; b_init(&pp);
+                b_putf(&pp, "%s->%s = %s;", up, fv[i].name, rc);
+                e_line(em, pp.s); free(pp.s);
+                continue;
             }
             b_putf(&st, "%s->%s = %s;", up, fv[i].name, src);
             e_line(em, st.s); free(st.s);
@@ -1693,11 +1776,13 @@ EStr emit_call(Emit *em, CmcNode *n) {
                         } else b_put(&b, "0");
                     }
                 }
-                /* record call-site object shapes for polymorphic params */
+                /* record call-site types so later passes type params from use */
                 if (fn) for (int i = 0; i < n->nargs && i < fn->nparams; i++) {
-                    if (args[i].type == CT_OBJ && args[i].struct_name &&
-                        fn->params[i] && fn->params[i]->kind == N_IDENT)
+                    if (!fn->params[i] || fn->params[i]->kind != N_IDENT) continue;
+                    if (args[i].type == CT_OBJ && args[i].struct_name)
                         cmc_record_param_shape(fn->fname, fn->params[i]->name, args[i].struct_name);
+                    else
+                        cmc_record_param_type(fn->fname, fn->params[i]->name, args[i].type);
                 }
                 b_put(&b, ")");
                 t = s->type;
@@ -1722,8 +1807,13 @@ EStr emit_call(Emit *em, CmcNode *n) {
     }
     if (callee->kind == N_MEMBER) {
         CmcNode *m = callee;
-        EStr o = emit_expr(em, m->obj);
         const char *prop = (m->prop && m->prop->name) ? m->prop->name : "";
+        if (m->obj && m->obj->kind == N_IDENT && m->obj->name &&
+                strcmp(m->obj->name, "Date") == 0 && strcmp(prop, "now") == 0 &&
+                n->nargs == 0) {
+            return estr("mochi_now_ms()", CT_DOUBLE, 0, 0, NULL);
+        }
+        EStr o = emit_expr(em, m->obj);
         /* a computed member call (arr[i](...)) is a call through the element
          * value, not a method call — handled as a stored-function call below */
         if (m->computed || !m->prop || !m->prop->name) {
@@ -2375,7 +2465,8 @@ void emit_function(Emit *em, CmcNode *fn) {
     for (int i = 0; i < fn->nparams; i++) {
         if (fn->params[i]->kind == N_IDENT) {
             const char *psh = cmc_param_shape(fn->fname, fn->params[i]->name);
-            pt[i] = psh ? CT_OBJ : infer_param_type_lite(em, fn, fn->params[i]->name);
+            CmcType ct = cmc_param_type(fn->fname, fn->params[i]->name);
+            pt[i] = psh ? CT_OBJ : (ct != CT_UNKNOWN ? ct : infer_param_type_lite(em, fn, fn->params[i]->name));
         } else pt[i] = CT_DOUBLE;
     }
     vol_pass(em, fn->body);

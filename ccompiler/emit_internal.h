@@ -49,7 +49,13 @@ typedef struct {
     const char *cur_up;        /* "struct __up_<fn>" or NULL */
     const char *cur_capt[16];  /* captured names */
     CmcType     cur_capt_type[16];
+    int         cur_capt_ref[16];  /* captured by reference (shared cell) */
     int         cur_ncapt;
+    /* by-reference capture cells: a `var` loop variable captured by a closure
+     * is shared by all closures (JS `var` semantics), not snapshotted. */
+    const char *ref_name[8];
+    const char *ref_cell[8];
+    int         ref_n;
 } Emit;
 
 /* prototypes (all functions share the Emit/Buf/EStr types) */
@@ -126,6 +132,8 @@ void emit_switch(Emit *em, CmcNode *n);
 void emit_stmt(Emit *em, CmcNode *n);
 CmcType fn_return_type(CmcNode *fn);
 int arrow_captures(Emit *em, CmcNode *arrow);
+int body_captures_name(Emit *em, CmcNode *body, const char *name);
+const char *ref_cell_for(Emit *em, const char *name);
 CmcType infer_param_type_lite(Emit *em, CmcNode *fn, const char *pname);
 void emit_function(Emit *em, CmcNode *fn);
 char *cmc_emit(CmcCtx *ctx, CmcNode *program);

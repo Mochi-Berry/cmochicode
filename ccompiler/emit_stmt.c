@@ -317,6 +317,26 @@ void emit_for(Emit *em, CmcNode *n) {
             b_put(&head, e.code); b_put(&head, "; ");
         }
     } else b_put(&head, "; ");
+    /* by-ref capture: the update must live in the body so the shared cell can
+     * be re-published right after it (the post-loop value is what JS exposes) */
+    int defer_update = 0;
+    const char *upd_text = NULL;
+    if (n->init && n->init->kind == N_VAR && n->init->nstmts > 0 && n->update &&
+        n->init->stmts[0]->lhs && n->init->stmts[0]->lhs->kind == N_IDENT &&
+        n->init->stmts[0]->op == TK_VAR &&
+        n->stmt && body_captures_name(em, n->stmt, n->init->stmts[0]->lhs->name)) {
+        defer_update = 1;
+        if (n->update->kind == N_UPDATE && n->update->lhs->kind == N_IDENT) {
+            CmcSym *s = cmc_env_lookup(&em->env, n->update->lhs->name);
+            char du[64];
+            snprintf(du, sizeof du, "%s %s= 1", s ? s->cname : n->update->lhs->name,
+                     n->update->op > 0 ? "+" : "-");
+            upd_text = cmc_arena_strndup(em->ctx->arena, du, strlen(du));
+        } else {
+            EStr u = emit_expr(em, n->update);
+            upd_text = cmc_arena_strndup(em->ctx->arena, u.code, strlen(u.code));
+        }
+    }
     if (n->test) {
         EStr c = emit_expr(em, n->test);
         Buf cond; b_init(&cond);
@@ -325,7 +345,7 @@ void emit_for(Emit *em, CmcNode *n) {
         free(cond.s);
     }
     b_put(&head, "; ");
-    if (n->update) {
+    if (n->update && !defer_update) {
         /* for-update: the value is discarded, so i++/i-- lower to i += 1 directly */
         if (n->update->kind == N_UPDATE && n->update->lhs->kind == N_IDENT) {
             CmcSym *s = cmc_env_lookup(&em->env, n->update->lhs->name);
@@ -338,12 +358,46 @@ void emit_for(Emit *em, CmcNode *n) {
     }
     b_put(&head, ") {");
     flush_pre(em);
+    /* A `var` loop variable captured by a closure is a SINGLE binding shared
+     * by every closure (JS `var` semantics): the closure holds a pointer to
+     * one cell that the loop keeps updating, instead of a per-iteration copy.
+     * `let` keeps the snapshot (per-iteration) form, which is correct JS. */
+    const char *cellvar = NULL;
+    if (n->init && n->init->kind == N_VAR && n->init->nstmts > 0) {
+        CmcNode *lvd = n->init->stmts[0];
+        if (lvd->lhs && lvd->lhs->kind == N_IDENT && lvd->op == TK_VAR) {
+            const char *lv = lvd->lhs->name;
+            if (n->stmt && body_captures_name(em, n->stmt, lv) && em->ref_n < 8) {
+                CmcSym *ls = cmc_env_lookup(&em->env, lv);
+                CmcType lt = ls ? ls->type : CT_INT;
+                cellvar = tmp_name(em, "cap");
+                e_linef(em, "%s *%s = (%s *)CMC_ALLOC(sizeof(%s));",
+                        cmc_type_name(lt), cellvar, cmc_type_name(lt), cmc_type_name(lt));
+                em->ref_name[em->ref_n] = lv;
+                em->ref_cell[em->ref_n] = cellvar;
+                em->ref_n++;
+            }
+        }
+    }
     e_line(em, head.s);
     free(head.s);
     em->indent++;
     emit_stmt(em, n->stmt);
+    if (cellvar && !defer_update) {
+        CmcSym *ls2 = cmc_env_lookup(&em->env, n->init->stmts[0]->lhs->name);
+        e_linef(em, "*%s = %s;", cellvar, ls2 ? ls2->cname : n->init->stmts[0]->lhs->name);
+    }
+    if (cellvar && defer_update) {
+        CmcSym *ls2 = cmc_env_lookup(&em->env, n->init->stmts[0]->lhs->name);
+        /* publish this iteration's value, run the update, publish again: a
+         * closure called after the loop sees the final value (JS `var`) */
+        e_linef(em, "*%s = %s;", cellvar, ls2 ? ls2->cname : n->init->stmts[0]->lhs->name);
+        e_linef(em, "%s;", upd_text);
+        e_linef(em, "*%s = %s;", cellvar, ls2 ? ls2->cname : n->init->stmts[0]->lhs->name);
+    }
     em->indent--;
     e_line(em, "}");
+    if (cellvar) em->ref_n--;
 }
 
 void emit_forof(Emit *em, CmcNode *n) {
